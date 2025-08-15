@@ -11,7 +11,6 @@
 .PARAMETER WhatIf
     Parse and classify emails but skip writing output files.
 
-
 .EXAMPLE
     .\OutlookAlertReporter.ps1
     Run the script interactively with prompts for all options.
@@ -47,10 +46,6 @@ $script:SelectedFolderObject = $null
 
 #region COM Object Management
 function Initialize-OutlookCom {
-    <#
-    .SYNOPSIS
-        Initialize Outlook COM application and namespace.
-    #>
     try {
         Write-Verbose "Initializing Outlook COM application..."
         
@@ -71,10 +66,6 @@ function Initialize-OutlookCom {
 }
 
 function Cleanup-ComObjects {
-    <#
-    .SYNOPSIS
-        Release all COM objects to prevent Outlook.exe from staying in memory.
-    #>
     if ($script:ComObjectsToCleanup.Count -gt 0) {
         Write-Verbose "Cleaning up $($script:ComObjectsToCleanup.Count) COM objects..."
     }
@@ -98,12 +89,10 @@ function Cleanup-ComObjects {
 
 #region User Input Functions
 function Show-MainMenu {
-    <#
-    .SYNOPSIS
-        Display the main menu and collect user preferences.
-    #>
-    Write-Host "`n=== Outlook Alert Reporter ===" -ForegroundColor Cyan
-    Write-Host "Analyze alert emails and generate comprehensive reports`n"
+    Write-Host ""
+    Write-Host "=== Outlook Alert Reporter ===" -ForegroundColor Cyan
+    Write-Host "Analyze alert emails and generate comprehensive reports"
+    Write-Host ""
     
     $config = @{}
     
@@ -141,11 +130,8 @@ function Show-MainMenu {
 }
 
 function Get-FolderSelection {
-    <#
-    .SYNOPSIS
-        Allow user to select Outlook folder (Inbox, browse subfolders, or entire mailbox).
-    #>
-    Write-Host "`n--- Folder Selection ---" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "--- Folder Selection ---" -ForegroundColor Yellow
     Write-Host "1. Use Inbox (default)"
     Write-Host "2. Browse and select specific folder"
     Write-Host "3. Search entire mailbox (all folders)"
@@ -163,10 +149,6 @@ function Get-FolderSelection {
 }
 
 function Get-FolderBrowser {
-    <#
-    .SYNOPSIS
-        Browse Outlook folder structure and let user select.
-    #>
     try {
         $comApp = Initialize-OutlookCom
         if (-not $comApp) { return "Inbox" }
@@ -174,7 +156,8 @@ function Get-FolderBrowser {
         $inbox = $comApp.Namespace.GetDefaultFolder(6) # olFolderInbox
         $script:ComObjectsToCleanup += $inbox
         
-        Write-Host "`nAvailable folders:"
+        Write-Host ""
+        Write-Host "Available folders:"
         Write-Host "0. Inbox (root)" -ForegroundColor Green
         
         $folders = @()
@@ -194,34 +177,6 @@ function Get-FolderBrowser {
             $folderDisplayInfo += @{ Index = $folderIndex; Name = $subfolder.Name; Folder = $subfolder; Path = "Inbox\$($subfolder.Name)" }
             $folderIndex++
         }
-        
-        # Add other root folders
-        try {
-            $sentItems = $comApp.Namespace.GetDefaultFolder(5) # Sent Items
-            $script:ComObjectsToCleanup += $sentItems
-            Write-Host "$folderIndex. Sent Items" -ForegroundColor Yellow
-            $folders += $sentItems
-            $folderDisplayInfo += @{ Index = $folderIndex; Name = "Sent Items"; Folder = $sentItems; Path = "SentItems" }
-            $folderIndex++
-        } catch { }
-        
-        try {
-            $drafts = $comApp.Namespace.GetDefaultFolder(16) # Drafts
-            $script:ComObjectsToCleanup += $drafts
-            Write-Host "$folderIndex. Drafts" -ForegroundColor Yellow
-            $folders += $drafts
-            $folderDisplayInfo += @{ Index = $folderIndex; Name = "Drafts"; Folder = $drafts; Path = "Drafts" }
-            $folderIndex++
-        } catch { }
-        
-        try {
-            $deletedItems = $comApp.Namespace.GetDefaultFolder(3) # Deleted Items
-            $script:ComObjectsToCleanup += $deletedItems
-            Write-Host "$folderIndex. Deleted Items" -ForegroundColor Yellow
-            $folders += $deletedItems
-            $folderDisplayInfo += @{ Index = $folderIndex; Name = "Deleted Items"; Folder = $deletedItems; Path = "DeletedItems" }
-            $folderIndex++
-        } catch { }
         
         do {
             $selection = Read-Host "`nSelect folder number [0]"
@@ -246,11 +201,8 @@ function Get-FolderBrowser {
 }
 
 function Get-FilterConfiguration {
-    <#
-    .SYNOPSIS
-        Get filter type (From/To/None) and email address from user.
-    #>
-    Write-Host "`n--- Email Filter Configuration ---" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "--- Email Filter Configuration ---" -ForegroundColor Yellow
     Write-Host "Choose filter type:"
     Write-Host "1. Filter by From address"
     Write-Host "2. Filter by To address" 
@@ -281,11 +233,8 @@ function Get-FilterConfiguration {
 }
 
 function Get-TimeWindowConfiguration {
-    <#
-    .SYNOPSIS
-        Get time window for email analysis.
-    #>
-    Write-Host "`n--- Time Window Configuration ---" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "--- Time Window Configuration ---" -ForegroundColor Yellow
     Write-Host "1. Last 7 days"
     Write-Host "2. Last 30 days"
     Write-Host "3. Custom date range"
@@ -328,21 +277,21 @@ function Get-TimeWindowConfiguration {
                 $validEnd = [DateTime]::TryParseExact($endDateInput, "yyyy-MM-dd", $null, [System.Globalization.DateTimeStyles]::None, [ref]$customEndDate)
             } while (-not $validEnd -or $customEndDate -lt $startDate)
             
+            $startStr = $startDate.ToString('yyyy-MM-dd')
+            $endStr = $customEndDate.ToString('yyyy-MM-dd')
+            
             return @{
                 StartDate = $startDate
                 EndDate = $customEndDate.AddDays(1).AddSeconds(-1)
-                Description = "Custom range: $($startDate.ToString('yyyy-MM-dd')) to $($customEndDate.ToString('yyyy-MM-dd'))"
+                Description = "Custom range: $startStr to $endStr"
             }
         }
     }
 }
 
 function Get-KeywordConfiguration {
-    <#
-    .SYNOPSIS
-        Allow user to customize priority keyword sets.
-    #>
-    Write-Host "`n--- Keyword Configuration ---" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "--- Keyword Configuration ---" -ForegroundColor Yellow
     
     Write-Host "Current high priority keywords:"
     Write-Host ($script:HighPriorityKeywords -join ", ") -ForegroundColor Red
@@ -354,7 +303,8 @@ function Get-KeywordConfiguration {
         $highPriorityKeywords = $script:HighPriorityKeywords
     }
     
-    Write-Host "`nCurrent low-hanging fruit keywords:"
+    Write-Host ""
+    Write-Host "Current low-hanging fruit keywords:"
     Write-Host ($script:LowHangingFruitKeywords -join ", ") -ForegroundColor Green
     
     $lowHangingInput = Read-Host "`nEnter low-hanging fruit keywords (comma-separated) or press Enter to use defaults"
@@ -371,11 +321,8 @@ function Get-KeywordConfiguration {
 }
 
 function Get-DuplicateConfiguration {
-    <#
-    .SYNOPSIS
-        Configure duplicate detection time bucket.
-    #>
-    Write-Host "`n--- Duplicate Detection Configuration ---" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "--- Duplicate Detection Configuration ---" -ForegroundColor Yellow
     Write-Host "Duplicate detection will use Message-ID when available."
     Write-Host "For fallback, emails within the same time bucket are considered potential duplicates."
     
@@ -396,14 +343,11 @@ function Get-DuplicateConfiguration {
 }
 
 function Get-OutputFolder {
-    <#
-    .SYNOPSIS
-        Get output folder for reports, defaulting to Desktop.
-    #>
     $desktop = [Environment]::GetFolderPath("Desktop")
     $defaultOutput = Join-Path $desktop "OutlookAlertReports"
     
-    Write-Host "`n--- Output Configuration ---" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "--- Output Configuration ---" -ForegroundColor Yellow
     $outputFolder = Read-Host "Enter output folder path [$defaultOutput]"
     
     if ([string]::IsNullOrEmpty($outputFolder)) {
@@ -427,10 +371,6 @@ function Get-OutputFolder {
 
 #region Email Processing Functions
 function Get-EmailData {
-    <#
-    .SYNOPSIS
-        Retrieve and filter emails from Outlook based on configuration.
-    #>
     param(
         [hashtable]$Config,
         [hashtable]$ComApp
@@ -440,7 +380,7 @@ function Get-EmailData {
         if ($Config.Folder -eq "EntireMailbox") {
             # Search entire mailbox across all folders
             Write-Host "Searching entire mailbox..." -ForegroundColor Green
-            return Get-EmailDataFromEntireMailbox -Config $Config -ComApp $ComApp
+            return Get-EmailDataFromAllFolders -Config $Config -ComApp $ComApp
         } else {
             # Search specific folder
             $folder = Get-OutlookFolder -FolderPath $Config.Folder -Namespace $ComApp.Namespace
@@ -461,93 +401,7 @@ function Get-EmailData {
     }
 }
 
-function Get-EmailDataFromEntireMailbox {
-    <#
-    .SYNOPSIS
-        Search for emails across the entire mailbox. Try AdvancedSearch first, then fallback to folder-by-folder.
-    #>
-    param(
-        [hashtable]$Config,
-        [hashtable]$ComApp
-    )
-    
-    Write-Verbose "Initiating mailbox-wide search..."
-    
-    # Try AdvancedSearch first (often fails in some Outlook configurations)
-    try {
-        Write-Verbose "Attempting AdvancedSearch method..."
-        
-        # Build search query for AdvancedSearch
-        $searchQuery = Build-AdvancedSearchQuery -Config $Config
-        Write-Verbose "Search query: $searchQuery"
-        
-        # Use AdvancedSearch for mailbox-wide searching
-        $search = $ComApp.Outlook.AdvancedSearch(
-            "All Mail Items",  # Scope: all mail folders
-            $searchQuery,      # DASL query
-            $false,           # SearchSubFolders (not needed for "All Mail Items")
-            "OutlookAlertSearch" # Tag for identification
-        )
-        $script:ComObjectsToCleanup += $search
-        
-        # Wait for search to complete (timeout after 30 seconds for quick test)
-        $timeout = 30
-        $elapsed = 0
-        Write-Host "Testing AdvancedSearch (this may take a moment)..." -ForegroundColor Yellow
-        
-        while (-not $search.Results -and $elapsed -lt $timeout) {
-            Start-Sleep -Seconds 1
-            $elapsed++
-            if ($elapsed % 5 -eq 0) {
-                Write-Verbose "AdvancedSearch in progress... ($elapsed seconds)"
-            }
-        }
-        
-        if ($search.Results) {
-            $results = $search.Results
-            $script:ComObjectsToCleanup += $results
-            
-            Write-Host "AdvancedSearch succeeded! Found $($results.Count) emails" -ForegroundColor Green
-            
-            # Process search results
-            $emailData = @()
-            $processedCount = 0
-            
-            foreach ($item in $results) {
-                $script:ComObjectsToCleanup += $item
-                
-                # Extract folder path from the item
-                $folderPath = try { $item.Parent.FolderPath } catch { "Unknown Folder" }
-                
-                $emailInfo = Extract-EmailInfo -Item $item -FolderPath $folderPath
-                if ($emailInfo) {
-                    $emailData += $emailInfo
-                    $processedCount++
-                    
-                    if (($processedCount % 100 -eq 0)) {
-                        Write-Verbose "Processed $processedCount emails from AdvancedSearch..."
-                    }
-                }
-            }
-            
-            Write-Host "Successfully processed $($emailData.Count) matching emails from AdvancedSearch" -ForegroundColor Green
-            return $emailData
-        } else {
-            throw "AdvancedSearch timed out or returned no results"
-        }
-    }
-    catch {
-        Write-Verbose "AdvancedSearch failed: $($_.Exception.Message)"
-        Write-Host "AdvancedSearch not available, using folder-by-folder method..." -ForegroundColor Yellow
-        return Get-EmailDataFromAllFolders -Config $Config -ComApp $ComApp
-    }
-}
-
 function Get-EmailDataFromAllFolders {
-    <#
-    .SYNOPSIS
-        Fallback method: manually search through all mail folders.
-    #>
     param(
         [hashtable]$Config,
         [hashtable]$ComApp
@@ -565,7 +419,7 @@ function Get-EmailDataFromAllFolders {
         $script:ComObjectsToCleanup += $rootFolder
         $foldersToSearch += $rootFolder
         $foldersToSearch += Get-SubFoldersRecursive -Folder $rootFolder
-        Write-Verbose "Added Inbox and subfolders: $($foldersToSearch.Count) folders so far"
+        Write-Verbose "Added Inbox and subfolders"
     } catch {
         Write-Warning "Could not access Inbox: $($_.Exception.Message)"
     }
@@ -579,26 +433,6 @@ function Get-EmailDataFromAllFolders {
         Write-Verbose "Added Sent Items and subfolders"
     } catch {
         Write-Verbose "Could not access Sent Items: $($_.Exception.Message)"
-    }
-    
-    try {
-        $drafts = $ComApp.Namespace.GetDefaultFolder(16) # Drafts
-        $script:ComObjectsToCleanup += $drafts
-        $foldersToSearch += $drafts
-        $foldersToSearch += Get-SubFoldersRecursive -Folder $drafts
-        Write-Verbose "Added Drafts and subfolders"
-    } catch {
-        Write-Verbose "Could not access Drafts: $($_.Exception.Message)"
-    }
-    
-    try {
-        $deletedItems = $ComApp.Namespace.GetDefaultFolder(3) # Deleted Items
-        $script:ComObjectsToCleanup += $deletedItems
-        $foldersToSearch += $deletedItems
-        $foldersToSearch += Get-SubFoldersRecursive -Folder $deletedItems
-        Write-Verbose "Added Deleted Items and subfolders"
-    } catch {
-        Write-Verbose "Could not access Deleted Items: $($_.Exception.Message)"
     }
     
     # Remove duplicates and filter out non-mail folders
@@ -632,7 +466,7 @@ function Get-EmailDataFromAllFolders {
             # Progress indicator
             if ($totalFolders -gt 10) {
                 $percent = [Math]::Round(($folderCount / $totalFolders) * 100, 1)
-                Write-Host "[$percent%] Searching folder $folderCount of $totalFolders`: $($folder.Name)" -ForegroundColor Cyan
+                Write-Host "[$percent%] Searching folder $folderCount of $totalFolders : $($folder.Name)" -ForegroundColor Cyan
             } else {
                 Write-Verbose "Searching folder: $($folder.FolderPath)"
             }
@@ -648,11 +482,13 @@ function Get-EmailDataFromAllFolders {
         }
     }
     
-    Write-Host "`nMailbox search complete! Found $($allEmailData.Count) total matching emails" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Mailbox search complete! Found $($allEmailData.Count) total matching emails" -ForegroundColor Green
     
     # Add diagnostic information
     if ($allEmailData.Count -eq 0) {
-        Write-Host "`nNo emails found matching the criteria. Troubleshooting tips:" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "No emails found matching the criteria. Troubleshooting tips:" -ForegroundColor Yellow
         Write-Host "  1. Check your date range - try expanding to last 30 days" -ForegroundColor Gray
         Write-Host "  2. If using address filter, verify the email address is correct" -ForegroundColor Gray
         Write-Host "  3. Try using 'No address filter' option to see all emails in date range" -ForegroundColor Gray
@@ -664,10 +500,6 @@ function Get-EmailDataFromAllFolders {
 }
 
 function Get-SubFoldersRecursive {
-    <#
-    .SYNOPSIS
-        Get all subfolders recursively.
-    #>
     param([object]$Folder)
     
     $subFolders = @()
@@ -686,10 +518,6 @@ function Get-SubFoldersRecursive {
 }
 
 function Get-EmailDataFromFolder {
-    <#
-    .SYNOPSIS
-        Search for emails in a specific folder.
-    #>
     param(
         [object]$Folder,
         [hashtable]$Config
@@ -758,42 +586,7 @@ function Get-EmailDataFromFolder {
     }
 }
 
-function Build-AdvancedSearchQuery {
-    <#
-    .SYNOPSIS
-        Build DASL query for AdvancedSearch across entire mailbox.
-    #>
-    param([hashtable]$Config)
-    
-    $conditions = @()
-    
-    # Date filter
-    $startDateStr = $Config.StartDate.ToString("MM/dd/yyyy HH:mm")
-    $endDateStr = $Config.EndDate.ToString("MM/dd/yyyy HH:mm")
-    $conditions += "`"urn:schemas:httpmail:datereceived`" >= `'$startDateStr`'"
-    $conditions += "`"urn:schemas:httpmail:datereceived`" <= `'$endDateStr`'"
-    
-    # Address filter (only if not "None")
-    if ($Config.FilterType -eq "From") {
-        $conditions += "`"urn:schemas:httpmail:fromemail`" = `'$($Config.FilterAddress)`'"
-    } elseif ($Config.FilterType -eq "To") {
-        # For To filter, we need to check multiple recipient fields
-        $toConditions = @()
-        $toConditions += "`"urn:schemas:httpmail:to`" LIKE `'%$($Config.FilterAddress)%`'"
-        $toConditions += "`"urn:schemas:httpmail:cc`" LIKE `'%$($Config.FilterAddress)%`'"
-        $toConditions += "`"urn:schemas:httpmail:bcc`" LIKE `'%$($Config.FilterAddress)%`'"
-        $conditions += "(" + ($toConditions -join " OR ") + ")"
-    }
-    # If FilterType is "None", don't add any address filters
-    
-    return ($conditions -join " AND ")
-}
-
 function Get-OutlookFolder {
-    <#
-    .SYNOPSIS
-        Get Outlook folder object by path.
-    #>
     param(
         [string]$FolderPath,
         [object]$Namespace
@@ -812,21 +605,9 @@ function Get-OutlookFolder {
         
         Write-Verbose "Attempting to resolve folder path: $FolderPath"
         
-        # Try direct folder path resolution first (works for full paths)
-        try {
-            $folder = $Namespace.GetFolderFromID($FolderPath)
-            if ($folder) {
-                Write-Verbose "Successfully resolved folder using GetFolderFromID"
-                return $folder
-            }
-        }
-        catch {
-            Write-Verbose "GetFolderFromID failed, trying path navigation"
-        }
-        
         # Parse the folder path - handle different formats
         $pathParts = @()
-        if ($FolderPath.Contains('\\')) {
+        if ($FolderPath.Contains('\')) {
             # Split on backslashes and filter out empty parts
             $pathParts = $FolderPath -split '\\' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
         } else {
@@ -903,10 +684,6 @@ function Get-OutlookFolder {
 }
 
 function Build-RestrictFilter {
-    <#
-    .SYNOPSIS
-        Build MAPI restriction filter for efficient email filtering.
-    #>
     param([hashtable]$Config)
     
     $filters = @()
@@ -914,14 +691,14 @@ function Build-RestrictFilter {
     # Date filter
     $startDateStr = $Config.StartDate.ToString("MM/dd/yyyy HH:mm")
     $endDateStr = $Config.EndDate.ToString("MM/dd/yyyy HH:mm")
-    $filters += "[ReceivedTime] >= `'$startDateStr`'"
-    $filters += "[ReceivedTime] <= `'$endDateStr`'"
+    $filters += "[ReceivedTime] >= '$startDateStr'"
+    $filters += "[ReceivedTime] <= '$endDateStr'"
     
     # Address filter (only if not "None")
     if ($Config.FilterType -eq "From") {
-        $filters += "[SenderEmailAddress] = `'$($Config.FilterAddress)`'"
+        $filters += "[SenderEmailAddress] = '$($Config.FilterAddress)'"
     } elseif ($Config.FilterType -eq "To") {
-        $filters += "[To] LIKE `'%$($Config.FilterAddress)%`'"
+        $filters += "[To] LIKE '%$($Config.FilterAddress)%'"
     }
     # If FilterType is "None", don't add any address filters
     
@@ -929,10 +706,6 @@ function Build-RestrictFilter {
 }
 
 function Test-EmailFilter {
-    <#
-    .SYNOPSIS
-        Test if email matches filter criteria (client-side fallback).
-    #>
     param(
         [object]$Item,
         [hashtable]$Config
@@ -961,10 +734,6 @@ function Test-EmailFilter {
 }
 
 function Extract-EmailInfo {
-    <#
-    .SYNOPSIS
-        Extract relevant information from an Outlook email item.
-    #>
     param(
         [object]$Item,
         [string]$FolderPath
@@ -1007,10 +776,6 @@ function Extract-EmailInfo {
 }
 
 function Get-RecipientsString {
-    <#
-    .SYNOPSIS
-        Get formatted string of all recipients.
-    #>
     param([object]$Item)
     
     try {
@@ -1027,10 +792,6 @@ function Get-RecipientsString {
 }
 
 function Get-NormalizedSubject {
-    <#
-    .SYNOPSIS
-        Normalize email subject by removing common prefixes and cleaning up.
-    #>
     param([string]$Subject)
     
     if ([string]::IsNullOrWhiteSpace($Subject)) {
@@ -1046,10 +807,6 @@ function Get-NormalizedSubject {
 }
 
 function Get-EmailBodyPreview {
-    <#
-    .SYNOPSIS
-        Get email body content for keyword matching (more comprehensive than preview).
-    #>
     param([object]$Item)
     
     try {
@@ -1104,10 +861,6 @@ function Get-EmailBodyPreview {
 }
 
 function Extract-ServerName {
-    <#
-    .SYNOPSIS
-        Extract server name from subject and body using regex patterns.
-    #>
     param(
         [string]$Subject,
         [string]$Body
@@ -1128,10 +881,6 @@ function Extract-ServerName {
 }
 
 function Process-EmailData {
-    <#
-    .SYNOPSIS
-        Classify emails and handle duplicates.
-    #>
     param(
         [array]$EmailData,
         [hashtable]$Config
@@ -1150,7 +899,8 @@ function Process-EmailData {
         $searchText = "$($email.Subject) $($email.Body)"
         
         if ($keywordDebugMode) {
-            Write-Host "`nProcessing email: $($email.Subject)" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "Processing email: $($email.Subject)" -ForegroundColor Cyan
             Write-Host "  Search text length: $($searchText.Length) characters" -ForegroundColor Gray
             if ($searchText.Length -gt 200) {
                 Write-Host "  First 200 chars: $($searchText.Substring(0, 200))..." -ForegroundColor Gray
@@ -1208,10 +958,6 @@ function Process-EmailData {
 }
 
 function Test-KeywordMatch {
-    <#
-    .SYNOPSIS
-        Test if text contains any of the specified keywords (case-insensitive).
-    #>
     param(
         [string]$Text,
         [array]$Keywords,
@@ -1228,7 +974,7 @@ function Test-KeywordMatch {
         $lowerKeyword = $keyword.ToLower()
         if ($lowerText.Contains($lowerKeyword)) {
             if ($Verbose) {
-                Write-Host "  ✓ Found keyword `'$keyword`' in email: $EmailSubject" -ForegroundColor Green
+                Write-Host "  ✓ Found keyword $keyword in email: $EmailSubject" -ForegroundColor Green
             }
             return $true
         }
@@ -1242,10 +988,6 @@ function Test-KeywordMatch {
 }
 
 function Get-DuplicateKey {
-    <#
-    .SYNOPSIS
-        Generate duplicate detection key for an email.
-    #>
     param(
         [hashtable]$Email,
         [int]$BucketMinutes
@@ -1258,7 +1000,7 @@ function Get-DuplicateKey {
     
     # Fallback to hash of normalized subject + server + bucketed timestamp
     $bucketedTime = [Math]::Floor($Email.ReceivedTime.Ticks / (600000000L * $BucketMinutes)) # Convert to bucket
-    $fallbackKey = "{0}|{1}|{2}" -f $Email.NormalizedSubject, $Email.ServerName, $bucketedTime
+    $fallbackKey = "{0}|{1}|{2}" -f $Email.NormalizedSubject, $Email.ServerName, $bucketedTime.ToString()
     
     return $fallbackKey
 }
@@ -1266,10 +1008,6 @@ function Get-DuplicateKey {
 
 #region Reporting Functions
 function Generate-Reports {
-    <#
-    .SYNOPSIS
-        Generate all reports (console summary, CSV files, HTML report).
-    #>
     param(
         [hashtable]$ProcessedData,
         [hashtable]$Config
@@ -1287,14 +1025,11 @@ function Generate-Reports {
     # Generate HTML report
     Export-HtmlReport -ProcessedData $ProcessedData -Config $Config
     
-    Write-Host "`nAll reports generated successfully in: $($Config.OutputFolder)" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "All reports generated successfully in: $($Config.OutputFolder)" -ForegroundColor Green
 }
 
 function Show-ConsoleSummary {
-    <#
-    .SYNOPSIS
-        Display comprehensive console summary.
-    #>
     param(
         [hashtable]$ProcessedData,
         [hashtable]$Config
@@ -1304,11 +1039,13 @@ function Show-ConsoleSummary {
     $uniqueEmails = $ProcessedData.UniqueEmails
     $duplicateEmails = $ProcessedData.DuplicateEmails
     
-    Write-Host "`n=== OUTLOOK ALERT ANALYSIS SUMMARY ===" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "=== OUTLOOK ALERT ANALYSIS SUMMARY ===" -ForegroundColor Cyan
     Write-Host "======================================="
     
     # Configuration summary
-    Write-Host "`nConfiguration:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Configuration:" -ForegroundColor Yellow
     Write-Host "  Time Window: $($Config.TimeDescription)"
     if ($Config.FilterType -eq "None") {
         Write-Host "  Filter: No address filter (all emails in scope)"
@@ -1319,7 +1056,8 @@ function Show-ConsoleSummary {
     Write-Host "  Duplicate Bucket: $($Config.DuplicateBucketMinutes) minutes"
     
     # Basic statistics
-    Write-Host "`nEmail Statistics:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Email Statistics:" -ForegroundColor Yellow
     Write-Host "  Total Matching Emails: $($allEmails.Count)"
     Write-Host "  Unique Alerts: $($uniqueEmails.Count)"
     Write-Host "  Duplicates: $($duplicateEmails.Count)"
@@ -1333,27 +1071,31 @@ function Show-ConsoleSummary {
     $lowHangingCount = ($allEmails | Where-Object { $_.LowHangingFruit }).Count
     $otherCount = $allEmails.Count - $highPriorityCount - $lowHangingCount
     
-    Write-Host "`nAlert Classification:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Alert Classification:" -ForegroundColor Yellow
     Write-Host "  High Priority: $highPriorityCount" -ForegroundColor Red
     Write-Host "  Low-Hanging Fruit: $lowHangingCount" -ForegroundColor Green
     Write-Host "  Other: $otherCount"
     
     # Top 10 subjects
-    Write-Host "`nTop 10 Subjects by Frequency:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Top 10 Subjects by Frequency:" -ForegroundColor Yellow
     $topSubjects = $allEmails | Group-Object NormalizedSubject | Sort-Object Count -Descending | Select-Object -First 10
     foreach ($subject in $topSubjects) {
         Write-Host "  $($subject.Count)x - $($subject.Name)"
     }
     
     # Top 10 servers
-    Write-Host "`nTop 10 Servers by Frequency:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Top 10 Servers by Frequency:" -ForegroundColor Yellow
     $topServers = $allEmails | Group-Object ServerName | Sort-Object Count -Descending | Select-Object -First 10
     foreach ($server in $topServers) {
         Write-Host "  $($server.Count)x - $($server.Name)"
     }
     
     # Alerts per day
-    Write-Host "`nAlerts per Day:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Alerts per Day:" -ForegroundColor Yellow
     $alertsPerDay = $allEmails | Group-Object { $_.ReceivedTime.Date } | Sort-Object Name
     foreach ($day in $alertsPerDay) {
         $date = [DateTime]$day.Name
@@ -1361,21 +1103,17 @@ function Show-ConsoleSummary {
     }
     
     # Most recent unique alerts
-    Write-Host "`n10 Most Recent Unique Alerts:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "10 Most Recent Unique Alerts:" -ForegroundColor Yellow
     $recentUnique = $uniqueEmails | Sort-Object ReceivedTime -Descending | Select-Object -First 10
     foreach ($email in $recentUnique) {
         $priority = if ($email.HighPriority) { " [HIGH]" } elseif ($email.LowHangingFruit) { " [LOW]" } else { "" }
         $timeStr = $email.ReceivedTime.ToString('yyyy-MM-dd HH:mm')
-        $outputLine = "  {0} | {1} | {2}{3}" -f $timeStr, $email.ServerName, $email.Subject, $priority
-        Write-Host $outputLine
+        Write-Host "  $timeStr - $($email.ServerName) - $($email.Subject)$priority"
     }
 }
 
 function Export-CsvReports {
-    <#
-    .SYNOPSIS
-        Export CSV reports for all emails, unique emails, and duplicates.
-    #>
     param(
         [hashtable]$ProcessedData,
         [hashtable]$Config
@@ -1407,10 +1145,6 @@ function Export-CsvReports {
 }
 
 function Convert-EmailsForCsv {
-    <#
-    .SYNOPSIS
-        Convert email hashtables to objects suitable for CSV export.
-    #>
     param([array]$Emails)
     
     return $Emails | ForEach-Object {
@@ -1432,43 +1166,7 @@ function Convert-EmailsForCsv {
     }
 }
 
-function Show-WhatIfSummary {
-    <#
-    .SYNOPSIS
-        Show summary for WhatIf mode without generating files.
-    #>
-    param(
-        [hashtable]$ProcessedData,
-        [hashtable]$Config
-    )
-    
-    Write-Host "`n=== WHATIF MODE - NO FILES GENERATED ===" -ForegroundColor Magenta
-    Show-ConsoleSummary -ProcessedData $ProcessedData -Config $Config
-    Write-Host "`nWhatIf complete. No files were written." -ForegroundColor Magenta
-}
-
-function Generate-EmptyReport {
-    <#
-    .SYNOPSIS
-        Generate empty report when no emails are found.
-    #>
-    param([hashtable]$Config)
-    
-    $emptyData = @{
-        AllEmails = @()
-        UniqueEmails = @()
-        DuplicateEmails = @()
-        DuplicateGroups = @{}
-    }
-    
-    Generate-Reports -ProcessedData $emptyData -Config $Config
-}
-
 function Export-HtmlReport {
-    <#
-    .SYNOPSIS
-        Generate comprehensive HTML report with inline CSS.
-    #>
     param(
         [hashtable]$ProcessedData,
         [hashtable]$Config
@@ -1487,7 +1185,9 @@ function Export-HtmlReport {
     $otherCount = $allEmails.Count - $highPriorityCount - $lowHangingCount
     $duplicateRatio = if ($allEmails.Count -gt 0) { [Math]::Round(($duplicateEmails.Count / $allEmails.Count) * 100, 1) } else { 0 }
     
-    # Build HTML content
+    $filterDesc = if ($Config.FilterType -eq "None") { "No address filter (all emails in scope)" } else { "$($Config.FilterType) = $($Config.FilterAddress)" }
+    
+    # Build HTML content with simple string concatenation
     $html = @"
 <!DOCTYPE html>
 <html lang="en">
@@ -1496,163 +1196,33 @@ function Export-HtmlReport {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Outlook Alert Analysis Report</title>
     <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #f5f5f5;
-            color: #333;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background-color: white;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #2c3e50;
-            text-align: center;
-            margin-bottom: 10px;
-            border-bottom: 3px solid #3498db;
-            padding-bottom: 10px;
-        }
-        .subtitle {
-            text-align: center;
-            color: #7f8c8d;
-            margin-bottom: 30px;
-        }
-        .section {
-            margin-bottom: 30px;
-        }
-        .section h2 {
-            color: #34495e;
-            border-left: 4px solid #3498db;
-            padding-left: 15px;
-            margin-bottom: 15px;
-        }
-        .config-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-        .config-item {
-            background-color: #ecf0f1;
-            padding: 15px;
-            border-radius: 5px;
-        }
-        .config-item strong {
-            color: #2c3e50;
-        }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-        .stat-card {
-            background-color: #ecf0f1;
-            padding: 20px;
-            border-radius: 8px;
-            text-align: center;
-        }
-        .stat-number {
-            font-size: 2em;
-            font-weight: bold;
-            color: #2c3e50;
-        }
-        .stat-label {
-            color: #7f8c8d;
-            margin-top: 5px;
-        }
-        .priority-high {
-            background-color: #fdf2f2;
-            border-left: 4px solid #e74c3c;
-        }
-        .priority-high .stat-number {
-            color: #e74c3c;
-        }
-        .priority-low {
-            background-color: #f0f9f4;
-            border-left: 4px solid #27ae60;
-        }
-        .priority-low .stat-number {
-            color: #27ae60;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 15px;
-        }
-        th, td {
-            text-align: left;
-            padding: 12px;
-            border-bottom: 1px solid #ddd;
-        }
-        th {
-            background-color: #34495e;
-            color: white;
-            font-weight: 600;
-        }
-        tr:nth-child(even) {
-            background-color: #f9f9f9;
-        }
-        tr:hover {
-            background-color: #f5f5f5;
-        }
-        .badge {
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 12px;
-            font-size: 0.8em;
-            font-weight: bold;
-            text-transform: uppercase;
-        }
-        .badge-high {
-            background-color: #e74c3c;
-            color: white;
-        }
-        .badge-low {
-            background-color: #27ae60;
-            color: white;
-        }
-        .badge-other {
-            background-color: #95a5a6;
-            color: white;
-        }
-        .top-list {
-            background-color: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            margin-top: 10px;
-        }
-        .top-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 8px 0;
-            border-bottom: 1px solid #e9ecef;
-        }
-        .top-item:last-child {
-            border-bottom: none;
-        }
-        .count-badge {
-            background-color: #3498db;
-            color: white;
-            padding: 2px 8px;
-            border-radius: 10px;
-            font-size: 0.9em;
-            font-weight: bold;
-        }
-        .footer {
-            margin-top: 30px;
-            text-align: center;
-            color: #7f8c8d;
-            font-size: 0.9em;
-            border-top: 1px solid #ddd;
-            padding-top: 15px;
-        }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; text-align: center; margin-bottom: 10px; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
+        .subtitle { text-align: center; color: #7f8c8d; margin-bottom: 30px; }
+        .section { margin-bottom: 30px; }
+        .section h2 { color: #34495e; border-left: 4px solid #3498db; padding-left: 15px; margin-bottom: 15px; }
+        .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .config-item { background-color: #ecf0f1; padding: 15px; border-radius: 5px; }
+        .config-item strong { color: #2c3e50; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background-color: #ecf0f1; padding: 20px; border-radius: 8px; text-align: center; }
+        .stat-number { font-size: 2em; font-weight: bold; color: #2c3e50; }
+        .stat-label { color: #7f8c8d; margin-top: 5px; }
+        .priority-high { background-color: #fdf2f2; border-left: 4px solid #e74c3c; }
+        .priority-high .stat-number { color: #e74c3c; }
+        .priority-low { background-color: #f0f9f4; border-left: 4px solid #27ae60; }
+        .priority-low .stat-number { color: #27ae60; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; }
+        th { background-color: #34495e; color: white; font-weight: 600; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        tr:hover { background-color: #f5f5f5; }
+        .top-list { background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin-top: 10px; }
+        .top-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e9ecef; }
+        .top-item:last-child { border-bottom: none; }
+        .count-badge { background-color: #3498db; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.9em; font-weight: bold; }
+        .footer { margin-top: 30px; text-align: center; color: #7f8c8d; font-size: 0.9em; border-top: 1px solid #ddd; padding-top: 15px; }
     </style>
 </head>
 <body>
@@ -1663,58 +1233,29 @@ function Export-HtmlReport {
         <div class="section">
             <h2>Configuration</h2>
             <div class="config-grid">
-                <div class="config-item">
-                    <strong>Time Window:</strong><br>$($Config.TimeDescription)
-                </div>
-                <div class="config-item">
-                    <strong>Filter:</strong><br>$(if ($Config.FilterType -eq "None") { "No address filter (all emails in scope)" } else { "$($Config.FilterType) = $($Config.FilterAddress)" })
-                </div>
-                <div class="config-item">
-                    <strong>Folder:</strong><br>$($Config.Folder)
-                </div>
-                <div class="config-item">
-                    <strong>Duplicate Bucket:</strong><br>$($Config.DuplicateBucketMinutes) minutes
-                </div>
+                <div class="config-item"><strong>Time Window:</strong><br>$($Config.TimeDescription)</div>
+                <div class="config-item"><strong>Filter:</strong><br>$filterDesc</div>
+                <div class="config-item"><strong>Folder:</strong><br>$($Config.Folder)</div>
+                <div class="config-item"><strong>Duplicate Bucket:</strong><br>$($Config.DuplicateBucketMinutes) minutes</div>
             </div>
         </div>
         
         <div class="section">
             <h2>Summary Statistics</h2>
             <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-number">$($allEmails.Count)</div>
-                    <div class="stat-label">Total Emails</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">$($uniqueEmails.Count)</div>
-                    <div class="stat-label">Unique Alerts</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">$($duplicateEmails.Count)</div>
-                    <div class="stat-label">Duplicates</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">$duplicateRatio%</div>
-                    <div class="stat-label">Duplicate Ratio</div>
-                </div>
+                <div class="stat-card"><div class="stat-number">$($allEmails.Count)</div><div class="stat-label">Total Emails</div></div>
+                <div class="stat-card"><div class="stat-number">$($uniqueEmails.Count)</div><div class="stat-label">Unique Alerts</div></div>
+                <div class="stat-card"><div class="stat-number">$($duplicateEmails.Count)</div><div class="stat-label">Duplicates</div></div>
+                <div class="stat-card"><div class="stat-number">$duplicateRatio%</div><div class="stat-label">Duplicate Ratio</div></div>
             </div>
         </div>
         
         <div class="section">
             <h2>Alert Classification</h2>
             <div class="stats-grid">
-                <div class="stat-card priority-high">
-                    <div class="stat-number">$highPriorityCount</div>
-                    <div class="stat-label">High Priority</div>
-                </div>
-                <div class="stat-card priority-low">
-                    <div class="stat-number">$lowHangingCount</div>
-                    <div class="stat-label">Low-Hanging Fruit</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">$otherCount</div>
-                    <div class="stat-label">Other</div>
-                </div>
+                <div class="stat-card priority-high"><div class="stat-number">$highPriorityCount</div><div class="stat-label">High Priority</div></div>
+                <div class="stat-card priority-low"><div class="stat-number">$lowHangingCount</div><div class="stat-label">Low-Hanging Fruit</div></div>
+                <div class="stat-card"><div class="stat-number">$otherCount</div><div class="stat-label">Other</div></div>
             </div>
         </div>
         
@@ -1727,12 +1268,7 @@ function Export-HtmlReport {
     $topSubjects = $allEmails | Group-Object NormalizedSubject | Sort-Object Count -Descending | Select-Object -First 10
     foreach ($subject in $topSubjects) {
         $safeSubjectName = if ($subject.Name) { $subject.Name -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;' } else { "(No Subject)" }
-        $html += @"
-                <div class="top-item">
-                    <span>$safeSubjectName</span>
-                    <span class="count-badge">$($subject.Count)</span>
-                </div>
-"@
+        $html += "<div class=""top-item""><span>$safeSubjectName</span><span class=""count-badge"">$($subject.Count)</span></div>"
     }
 
     $html += @"
@@ -1748,12 +1284,7 @@ function Export-HtmlReport {
     $topServers = $allEmails | Group-Object ServerName | Sort-Object Count -Descending | Select-Object -First 10
     foreach ($server in $topServers) {
         $safeServerName = if ($server.Name) { $server.Name -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;' } else { "Unknown" }
-        $html += @"
-                <div class="top-item">
-                    <span>$safeServerName</span>
-                    <span class="count-badge">$($server.Count)</span>
-                </div>
-"@
+        $html += "<div class=""top-item""><span>$safeServerName</span><span class=""count-badge"">$($server.Count)</span></div>"
     }
 
     $html += @"
@@ -1763,12 +1294,7 @@ function Export-HtmlReport {
         <div class="section">
             <h2>Alerts per Day</h2>
             <table>
-                <thead>
-                    <tr>
-                        <th>Date</th>
-                        <th>Alert Count</th>
-                    </tr>
-                </thead>
+                <thead><tr><th>Date</th><th>Alert Count</th></tr></thead>
                 <tbody>
 "@
 
@@ -1776,12 +1302,8 @@ function Export-HtmlReport {
     $alertsPerDay = $allEmails | Group-Object { $_.ReceivedTime.Date } | Sort-Object Name
     foreach ($day in $alertsPerDay) {
         $date = [DateTime]$day.Name
-        $html += @"
-                    <tr>
-                        <td>$($date.ToString('yyyy-MM-dd'))</td>
-                        <td>$($day.Count)</td>
-                    </tr>
-"@
+        $dateStr = $date.ToString('yyyy-MM-dd')
+        $html += "<tr><td>$dateStr</td><td>$($day.Count)</td></tr>"
     }
 
     $html += @"
@@ -1792,14 +1314,7 @@ function Export-HtmlReport {
         <div class="section">
             <h2>10 Most Recent Unique Alerts</h2>
             <table>
-                <thead>
-                    <tr>
-                        <th>Date/Time</th>
-                        <th>Server</th>
-                        <th>Subject</th>
-                        <th>Priority</th>
-                    </tr>
-                </thead>
+                <thead><tr><th>Date/Time</th><th>Server</th><th>Subject</th><th>Priority</th></tr></thead>
                 <tbody>
 "@
 
@@ -1807,24 +1322,18 @@ function Export-HtmlReport {
     $recentUnique = $uniqueEmails | Sort-Object ReceivedTime -Descending | Select-Object -First 10
     foreach ($email in $recentUnique) {
         $priorityBadge = if ($email.HighPriority) { 
-            '<span class="badge badge-high">High</span>' 
+            'High' 
         } elseif ($email.LowHangingFruit) { 
-            '<span class="badge badge-low">Low</span>' 
+            'Low' 
         } else { 
-            '<span class="badge badge-other">Other</span>' 
+            'Other' 
         }
         
         $safeServerName = if ($email.ServerName) { $email.ServerName -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;' } else { "Unknown" }
         $safeSubject = if ($email.Subject) { $email.Subject -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;' } else { "(No Subject)" }
+        $timeStr = $email.ReceivedTime.ToString('yyyy-MM-dd HH:mm')
         
-        $html += @"
-                    <tr>
-                        <td>$($email.ReceivedTime.ToString('yyyy-MM-dd HH:mm'))</td>
-                        <td>$safeServerName</td>
-                        <td>$safeSubject</td>
-                        <td>$priorityBadge</td>
-                    </tr>
-"@
+        $html += "<tr><td>$timeStr</td><td>$safeServerName</td><td>$safeSubject</td><td>$priorityBadge</td></tr>"
     }
 
     $html += @"
@@ -1848,6 +1357,32 @@ function Export-HtmlReport {
     
     Write-Host "  Exported: alerts_report.html" -ForegroundColor Green
 }
+
+function Show-WhatIfSummary {
+    param(
+        [hashtable]$ProcessedData,
+        [hashtable]$Config
+    )
+    
+    Write-Host ""
+    Write-Host "=== WHATIF MODE - NO FILES GENERATED ===" -ForegroundColor Magenta
+    Show-ConsoleSummary -ProcessedData $ProcessedData -Config $Config
+    Write-Host ""
+    Write-Host "WhatIf complete. No files were written." -ForegroundColor Magenta
+}
+
+function Generate-EmptyReport {
+    param([hashtable]$Config)
+    
+    $emptyData = @{
+        AllEmails = @()
+        UniqueEmails = @()
+        DuplicateEmails = @()
+        DuplicateGroups = @{}
+    }
+    
+    Generate-Reports -ProcessedData $emptyData -Config $Config
+}
 #endregion
 
 # Initialize error handling
@@ -1866,7 +1401,8 @@ Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
 # Main execution starts here
 try {
     Write-Host "PowerShell Outlook Alert Reporter" -ForegroundColor Cyan
-    Write-Host "==================================`n"
+    Write-Host "=================================="
+    Write-Host ""
     
     if ($WhatIf) {
         Write-Host "Running in WhatIf mode - no files will be written" -ForegroundColor Yellow
@@ -1883,7 +1419,8 @@ try {
         exit 0
     }
     
-    Write-Host "`nConfiguration complete. Starting analysis..." -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Configuration complete. Starting analysis..." -ForegroundColor Green
     
     # Initialize Outlook and analyze emails
     $comApp = Initialize-OutlookCom
