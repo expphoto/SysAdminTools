@@ -11,6 +11,24 @@
 .PARAMETER WhatIf
     Parse and classify emails but skip writing output files.
 
+.PARAMETER NonInteractive
+    Run without user prompts using default or specified parameter values.
+
+.PARAMETER Folder
+    Folder to analyze (default: "Inbox"). Can be "Inbox", "EntireMailbox", or specific folder path.
+
+.PARAMETER FilterType
+    Email filter type: "None", "From", or "To" (default: "None").
+
+.PARAMETER FilterAddress
+    Email address to filter by when FilterType is "From" or "To".
+
+.PARAMETER DaysBack
+    Number of days back to analyze (default: 7).
+
+.PARAMETER OutputFolder
+    Custom output folder path (default: Desktop\OutlookAlertReports).
+
 .EXAMPLE
     .\OutlookAlertReporter.ps1
     Run the script interactively with prompts for all options.
@@ -18,11 +36,25 @@
 .EXAMPLE
     .\OutlookAlertReporter.ps1 -WhatIf -Verbose
     Run in test mode with detailed output but no file generation.
+
+.EXAMPLE
+    .\OutlookAlertReporter.ps1 -NonInteractive
+    Run with default settings (Inbox, last 7 days, no address filter).
+
+.EXAMPLE
+    .\OutlookAlertReporter.ps1 -NonInteractive -DaysBack 30 -FilterType From -FilterAddress "alerts@example.com"
+    Analyze last 30 days of emails from alerts@example.com in non-interactive mode.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$WhatIf
+    [switch]$WhatIf,
+    [switch]$NonInteractive,
+    [string]$Folder = "Inbox",
+    [string]$FilterType = "None",
+    [string]$FilterAddress = "",
+    [int]$DaysBack = 7,
+    [string]$OutputFolder = ""
 )
 
 # Script-level variables and defaults
@@ -37,7 +69,13 @@ $script:LowHangingFruitKeywords = @(
 
 $script:ServerNameRegexes = @(
     '(?i)\b(?:srv|server|host|node|dc|sql|exch|rdp|fs|web)[-_ ]?([a-z0-9\-]{2,})\b',
-    '(?i)\b([a-z0-9\-]{3,})\.(?:local|lan|corp|internal|example\.com)\b'
+    '(?i)\b([a-z0-9\-]{3,})\.(?:local|lan|corp|internal|example\.com)\b',
+    '(?i)(?:server|host|machine|node)\s+(?:name\s+)?[''"]?([a-z0-9\-\.]{3,})[''"]?',
+    '(?i)\b([a-z0-9\-]{3,})\.(?:com|net|org|edu|gov)\b',
+    '(?i)Your\s+server\s+\(([^)]+)\)',
+    '(?i)Server:\s*([a-z0-9\-\.]{3,})',
+    '(?i)Host:\s*([a-z0-9\-\.]{3,})',
+    '(?i)Machine:\s*([a-z0-9\-\.]{3,})'
 )
 
 $script:DuplicateBucketMinutes = 30
@@ -367,6 +405,54 @@ function Get-OutputFolder {
     
     return $outputFolder
 }
+
+function Get-DefaultConfiguration {
+    Write-Host "Using default configuration settings:"
+    
+    # Set default output folder
+    $defaultOutputFolder = if ([string]::IsNullOrEmpty($OutputFolder)) {
+        $desktop = [Environment]::GetFolderPath("Desktop")
+        Join-Path $desktop "OutlookAlertReports"
+    } else {
+        $OutputFolder
+    }
+    
+    # Create output folder if it doesn't exist
+    if (-not (Test-Path $defaultOutputFolder)) {
+        try {
+            New-Item -Path $defaultOutputFolder -ItemType Directory -Force | Out-Null
+            Write-Host "  Created output folder: $defaultOutputFolder" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Could not create output folder: $defaultOutputFolder"
+            $defaultOutputFolder = [Environment]::GetFolderPath("Desktop")
+        }
+    }
+    
+    # Calculate date range
+    $endDate = Get-Date
+    $startDate = $endDate.AddDays(-$DaysBack)
+    
+    $config = @{
+        Folder = $Folder
+        FilterType = $FilterType
+        FilterAddress = $FilterAddress
+        StartDate = $startDate
+        EndDate = $endDate
+        TimeDescription = "Last $DaysBack days"
+        HighPriorityKeywords = $script:HighPriorityKeywords
+        LowHangingFruitKeywords = $script:LowHangingFruitKeywords
+        DuplicateBucketMinutes = $script:DuplicateBucketMinutes
+        OutputFolder = $defaultOutputFolder
+    }
+    
+    Write-Host "  Folder: $($config.Folder)" -ForegroundColor Gray
+    Write-Host "  Filter: $($config.FilterType)$(if ($config.FilterAddress) { " = $($config.FilterAddress)" })" -ForegroundColor Gray
+    Write-Host "  Time Window: $($config.TimeDescription)" -ForegroundColor Gray
+    Write-Host "  Output Folder: $($config.OutputFolder)" -ForegroundColor Gray
+    
+    return $config
+}
 #endregion
 
 #region Email Processing Functions
@@ -534,45 +620,101 @@ function Get-EmailDataFromFolder {
         $items = $Folder.Items
         $script:ComObjectsToCleanup += $items
         
+        Write-Verbose "Folder $($Folder.Name): $($items.Count) total items before filtering"
+        
         if ($restrictFilter) {
             try {
-                $items = $items.Restrict($restrictFilter)
-                $script:ComObjectsToCleanup += $items
+                $restrictedItems = $items.Restrict($restrictFilter)
+                $script:ComObjectsToCleanup += $restrictedItems
+                Write-Verbose "Restriction filter returned $($restrictedItems.Count) items"
+                # If restriction worked and returned results, use it
+                if ($restrictedItems.Count -gt 0) {
+                    $items = $restrictedItems
+                } else {
+                    Write-Verbose "Restriction filter returned 0 items, falling back to client-side filtering"
+                }
             }
             catch {
-                Write-Verbose "Restriction filter failed for folder $($Folder.Name), using client-side filtering"
+                Write-Verbose "Restriction filter failed for folder $($Folder.Name), using client-side filtering: $($_.Exception.Message)"
             }
         }
         
-        # Sort by received time descending
-        $items = $items.Sort("[ReceivedTime]", $true)
-        $script:ComObjectsToCleanup += $items
-        
-        Write-Verbose "Folder $($Folder.Name): $($items.Count) items after filtering"
+        # Convert COM collection to PowerShell array for reliable iteration
+        $itemsArray = @()
+        try {
+            if ($items -and $items.Count -gt 0) {
+                for ($i = 1; $i -le $items.Count; $i++) {
+                    $item = $items.Item($i)
+                    if ($item) {
+                        $itemsArray += $item
+                    }
+                }
+                Write-Verbose "Folder $($Folder.Name): Converted $($itemsArray.Count) items to PowerShell array"
+            } else {
+                Write-Verbose "Folder $($Folder.Name): No items to convert"
+            }
+        }
+        catch {
+            Write-Verbose "Failed to convert items to array for folder $($Folder.Name): $($_.Exception.Message)"
+            # Fallback to direct iteration
+            $itemsArray = $items
+        }
         
         # Process items and extract data
         $emailData = @()
         $processedCount = 0
         
-        foreach ($item in $items) {
+        $itemIndex = 0
+        $dateFilteredOut = 0
+        $addressFilteredOut = 0
+        $extractionFailed = 0
+        
+        foreach ($item in $itemsArray) {
+            if (-not $item) {
+                Write-Verbose "Skipping null item"
+                continue
+            }
+            
             $script:ComObjectsToCleanup += $item
+            $itemIndex++
             
-            # Client-side date filter if restriction didn't work
-            if ($item.ReceivedTime -lt $Config.StartDate -or $item.ReceivedTime -gt $Config.EndDate) {
-                continue
+            try {
+                # Client-side date filter if restriction didn't work
+                if ($item.ReceivedTime -lt $Config.StartDate -or $item.ReceivedTime -gt $Config.EndDate) {
+                    $dateFilteredOut++
+                    if ($itemIndex -le 3) {
+                        Write-Verbose "Item $itemIndex - Date $($item.ReceivedTime) is outside range $($Config.StartDate) to $($Config.EndDate)"
+                    }
+                    continue
+                }
+                
+                # Client-side address filter if restriction didn't work
+                if (-not (Test-EmailFilter -Item $item -Config $Config)) {
+                    $addressFilteredOut++
+                    if ($itemIndex -le 3) {
+                        Write-Verbose "Item $itemIndex - Failed address filter test"
+                    }
+                    continue
+                }
+                
+                $emailInfo = Extract-EmailInfo -Item $item -FolderPath $Folder.FolderPath
+                if ($emailInfo) {
+                    $emailData += $emailInfo
+                    $processedCount++
+                    if ($processedCount -le 3) {
+                        Write-Verbose "Successfully processed email $processedCount - $($item.Subject)"
+                    }
+                } else {
+                    $extractionFailed++
+                }
             }
-            
-            # Client-side address filter if restriction didn't work
-            if (-not (Test-EmailFilter -Item $item -Config $Config)) {
-                continue
-            }
-            
-            $emailInfo = Extract-EmailInfo -Item $item -FolderPath $Folder.FolderPath
-            if ($emailInfo) {
-                $emailData += $emailInfo
-                $processedCount++
+            catch {
+                Write-Verbose "Error processing item $itemIndex : $($_.Exception.Message)"
+                $extractionFailed++
             }
         }
+        
+        Write-Verbose "Processing summary: $itemIndex total, $dateFilteredOut date filtered, $addressFilteredOut address filtered, $extractionFailed extraction failed, $processedCount successful"
         
         if ($emailData.Count -gt 0) {
             Write-Verbose "Found $($emailData.Count) matching emails in folder: $($Folder.Name)"
@@ -694,6 +836,8 @@ function Build-RestrictFilter {
     $filters += "[ReceivedTime] >= '$startDateStr'"
     $filters += "[ReceivedTime] <= '$endDateStr'"
     
+    Write-Verbose "Date range: $startDateStr to $endDateStr"
+    
     # Address filter (only if not "None")
     if ($Config.FilterType -eq "From") {
         $filters += "[SenderEmailAddress] = '$($Config.FilterAddress)'"
@@ -740,17 +884,26 @@ function Extract-EmailInfo {
     )
     
     try {
-        $emailInfo = @{
-            ReceivedTime = $Item.ReceivedTime
-            SenderEmailAddress = $Item.SenderEmailAddress
+        if (-not $Item) {
+            Write-Verbose "Extract-EmailInfo: Item is null"
+            return $null
+        }
+        
+        $emailInfo = [PSCustomObject]@{
+            ReceivedTime = if ($Item.ReceivedTime) { $Item.ReceivedTime } else { Get-Date }
+            SenderEmailAddress = if ($Item.SenderEmailAddress) { $Item.SenderEmailAddress } else { "" }
             To = Get-RecipientsString -Item $Item
-            Subject = $Item.Subject
-            NormalizedSubject = Get-NormalizedSubject -Subject $Item.Subject
+            Subject = if ($Item.Subject) { $Item.Subject } else { "(No Subject)" }
+            NormalizedSubject = Get-NormalizedSubject -Subject $(if ($Item.Subject) { $Item.Subject } else { "" })
             Body = Get-EmailBodyPreview -Item $Item
-            EntryID = $Item.EntryID
+            EntryID = if ($Item.EntryID) { $Item.EntryID } else { "" }
             FolderPath = $FolderPath
             InternetMessageId = $null
             ServerName = $null
+            HighPriority = $false
+            LowHangingFruit = $false
+            IsDuplicate = $false
+            DuplicateGroupId = ""
         }
         
         # Get Internet Message ID via PropertyAccessor
@@ -779,10 +932,18 @@ function Get-RecipientsString {
     param([object]$Item)
     
     try {
+        if (-not $Item -or -not $Item.Recipients) {
+            return ""
+        }
+        
         $recipients = @()
         foreach ($recipient in $Item.Recipients) {
-            $script:ComObjectsToCleanup += $recipient
-            $recipients += $recipient.Address
+            if ($recipient) {
+                $script:ComObjectsToCleanup += $recipient
+                if ($recipient.Address) {
+                    $recipients += $recipient.Address
+                }
+            }
         }
         return ($recipients -join "; ")
     }
@@ -795,13 +956,18 @@ function Get-NormalizedSubject {
     param([string]$Subject)
     
     if ([string]::IsNullOrWhiteSpace($Subject)) {
-        return ""
+        return "(No Subject)"
     }
     
-    # Remove common prefixes and normalize
-    $normalized = $Subject -replace '^\s*(?:RE:|FW:|FWD:|\[ALERT\]|\[WARNING\]|\[ERROR\])\s*', '' -replace '\s+', ' '
-    $normalized = $normalized -replace '[^\w\s\-]', '' # Remove special characters except word chars, spaces, hyphens
+    # Remove common prefixes and normalize whitespace
+    $normalized = $Subject -replace '^\s*(?:RE:|FW:|FWD:|\[ALERT\]|\[WARNING\]|\[ERROR\])\s*', ''
+    $normalized = $normalized -replace '\s+', ' '
     $normalized = $normalized.Trim()
+    
+    # If after cleaning it's empty, return the original subject
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $Subject.Trim()
+    }
     
     return $normalized
 }
@@ -875,6 +1041,24 @@ function Extract-ServerName {
                 return $serverName.ToLower().Trim()
             }
         }
+    }
+    
+    # For non-server emails (like campaign emails), extract a more meaningful identifier
+    if ($Subject -match '(?i)campaign.*?(?:to|for)\s+([^.]+)') {
+        return "Campaign"
+    }
+    
+    if ($Subject -match '(?i)newsletter|marketing|promotion') {
+        return "Marketing"
+    }
+    
+    if ($Subject -match '(?i)notification|alert|update') {
+        return "Notification"
+    }
+    
+    # Try to extract sender domain as fallback
+    if ($Body -match '(?i)from[:\s]+.*?@([a-z0-9\-\.]+\.[a-z]{2,})') {
+        return $matches[1].ToLower()
     }
     
     return "Unknown"
@@ -974,14 +1158,14 @@ function Test-KeywordMatch {
         $lowerKeyword = $keyword.ToLower()
         if ($lowerText.Contains($lowerKeyword)) {
             if ($Verbose) {
-                Write-Host "  ✓ Found keyword $keyword in email: $EmailSubject" -ForegroundColor Green
+                Write-Host "  Found keyword $keyword in email: $EmailSubject" -ForegroundColor Green
             }
             return $true
         }
     }
     
     if ($Verbose -and -not [string]::IsNullOrWhiteSpace($EmailSubject)) {
-        Write-Verbose "  ✗ No keywords found in: $EmailSubject"
+        Write-Verbose "  No keywords found in: $EmailSubject"
     }
     
     return $false
@@ -989,7 +1173,7 @@ function Test-KeywordMatch {
 
 function Get-DuplicateKey {
     param(
-        [hashtable]$Email,
+        [object]$Email,
         [int]$BucketMinutes
     )
     
@@ -999,8 +1183,11 @@ function Get-DuplicateKey {
     }
     
     # Fallback to hash of normalized subject + server + bucketed timestamp
-    $bucketedTime = [Math]::Floor($Email.ReceivedTime.Ticks / (600000000L * $BucketMinutes)) # Convert to bucket
-    $fallbackKey = "{0}|{1}|{2}" -f $Email.NormalizedSubject, $Email.ServerName, $bucketedTime.ToString()
+    $bucketedTime = [Math]::Floor($Email.ReceivedTime.Ticks / (600000000L * $BucketMinutes))
+    $part1 = $Email.NormalizedSubject
+    $part2 = $Email.ServerName  
+    $part3 = $bucketedTime.ToString()
+    $fallbackKey = "$part1-$part2-$part3"
     
     return $fallbackKey
 }
@@ -1077,12 +1264,20 @@ function Show-ConsoleSummary {
     Write-Host "  Low-Hanging Fruit: $lowHangingCount" -ForegroundColor Green
     Write-Host "  Other: $otherCount"
     
+    # Debug: Check first few emails
+    Write-Verbose "Debug: First 3 email subjects and servers:"
+    for ($i = 0; $i -lt [Math]::Min(3, $allEmails.Count); $i++) {
+        $email = $allEmails[$i]
+        Write-Verbose "  Email $i - Subject: '$($email.Subject)' | NormalizedSubject: '$($email.NormalizedSubject)' | ServerName: '$($email.ServerName)'"
+    }
+    
     # Top 10 subjects
     Write-Host ""
     Write-Host "Top 10 Subjects by Frequency:" -ForegroundColor Yellow
     $topSubjects = $allEmails | Group-Object NormalizedSubject | Sort-Object Count -Descending | Select-Object -First 10
     foreach ($subject in $topSubjects) {
-        Write-Host "  $($subject.Count)x - $($subject.Name)"
+        $displayName = if ([string]::IsNullOrWhiteSpace($subject.Name)) { "(Empty Subject)" } else { $subject.Name }
+        Write-Host "  $($subject.Count)x - $displayName"
     }
     
     # Top 10 servers
@@ -1090,7 +1285,8 @@ function Show-ConsoleSummary {
     Write-Host "Top 10 Servers by Frequency:" -ForegroundColor Yellow
     $topServers = $allEmails | Group-Object ServerName | Sort-Object Count -Descending | Select-Object -First 10
     foreach ($server in $topServers) {
-        Write-Host "  $($server.Count)x - $($server.Name)"
+        $displayName = if ([string]::IsNullOrWhiteSpace($server.Name)) { "(No Server)" } else { $server.Name }
+        Write-Host "  $($server.Count)x - $displayName"
     }
     
     # Alerts per day
@@ -1139,29 +1335,35 @@ function Export-CsvReports {
     $uniqueCount = $csvUniqueEmails.Count 
     $duplicateCount = $csvDuplicateEmails.Count
     
-    Write-Host "  Exported: alerts_all.csv ($allCount rows)" -ForegroundColor Green
-    Write-Host "  Exported: alerts_unique.csv ($uniqueCount rows)" -ForegroundColor Green
-    Write-Host "  Exported: alerts_duplicates.csv ($duplicateCount rows)" -ForegroundColor Green
+    Write-Host "  Exported: alerts_all.csv - $allCount rows" -ForegroundColor Green
+    Write-Host "  Exported: alerts_unique.csv - $uniqueCount rows" -ForegroundColor Green
+    Write-Host "  Exported: alerts_duplicates.csv - $duplicateCount rows" -ForegroundColor Green
 }
 
 function Convert-EmailsForCsv {
     param([array]$Emails)
     
+    if (-not $Emails) {
+        return @()
+    }
+    
     return $Emails | ForEach-Object {
-        [PSCustomObject]@{
-            ReceivedTime = $_.ReceivedTime.ToString('yyyy-MM-dd HH:mm:ss')
-            SenderEmailAddress = $_.SenderEmailAddress
-            To = $_.To
-            Subject = $_.Subject
-            NormalizedSubject = $_.NormalizedSubject
-            ServerName = $_.ServerName
-            HighPriority = $_.HighPriority
-            LowHangingFruit = $_.LowHangingFruit
-            IsDuplicate = $_.IsDuplicate
-            DuplicateGroupId = $_.DuplicateGroupId
-            EntryID = $_.EntryID
-            InternetMessageId = $_.InternetMessageId
-            FolderPath = $_.FolderPath
+        if ($_) {
+            [PSCustomObject]@{
+                ReceivedTime = if ($_.ReceivedTime) { $_.ReceivedTime.ToString('yyyy-MM-dd HH:mm:ss') } else { "" }
+                SenderEmailAddress = if ($_.SenderEmailAddress) { $_.SenderEmailAddress } else { "" }
+                To = if ($_.To) { $_.To } else { "" }
+                Subject = if ($_.Subject) { $_.Subject } else { "" }
+                NormalizedSubject = if ($_.NormalizedSubject) { $_.NormalizedSubject } else { "" }
+                ServerName = if ($_.ServerName) { $_.ServerName } else { "" }
+                HighPriority = if ($_.HighPriority -ne $null) { $_.HighPriority } else { $false }
+                LowHangingFruit = if ($_.LowHangingFruit -ne $null) { $_.LowHangingFruit } else { $false }
+                IsDuplicate = if ($_.IsDuplicate -ne $null) { $_.IsDuplicate } else { $false }
+                DuplicateGroupId = if ($_.DuplicateGroupId) { $_.DuplicateGroupId } else { "" }
+                EntryID = if ($_.EntryID) { $_.EntryID } else { "" }
+                InternetMessageId = if ($_.InternetMessageId) { $_.InternetMessageId } else { "" }
+                FolderPath = if ($_.FolderPath) { $_.FolderPath } else { "" }
+            }
         }
     }
 }
@@ -1386,12 +1588,13 @@ function Generate-EmptyReport {
 #endregion
 
 # Initialize error handling
-$ErrorActionPreference = "Stop"
-trap {
-    Write-Error "Script terminated due to error: $($_.Exception.Message)"
-    Cleanup-ComObjects
-    exit 1
-}
+$ErrorActionPreference = "Continue"
+# trap {
+#     $errorMessage = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { "Unknown error" }
+#     Write-Error "Script terminated due to error: $errorMessage"
+#     Cleanup-ComObjects
+#     exit 1
+# }
 
 # Register cleanup on script exit
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
@@ -1413,10 +1616,15 @@ try {
     }
     
     # Get user configuration
-    $config = Show-MainMenu
-    if (-not $config) {
-        Write-Host "Configuration cancelled. Exiting." -ForegroundColor Red
-        exit 0
+    if ($NonInteractive) {
+        Write-Host "Running in non-interactive mode with default settings..." -ForegroundColor Green
+        $config = Get-DefaultConfiguration
+    } else {
+        $config = Show-MainMenu
+        if (-not $config) {
+            Write-Host "Configuration cancelled. Exiting." -ForegroundColor Red
+            exit 0
+        }
     }
     
     Write-Host ""
