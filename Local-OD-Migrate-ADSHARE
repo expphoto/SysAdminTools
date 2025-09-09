@@ -1,0 +1,400 @@
+# OneDriveMigration.ps1 - Complete H Drive to OneDrive Migration
+# Handles: AD home path removal, folder redirection cleanup, OneDrive setup, data migration
+
+param(
+    [switch]$WhatIf,
+    [string]$LogPath = "$env:TEMP\OneDriveMigration.log",
+    [string]$TenantID = "" # Will be populated on work machine
+)
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$Level] $Message"
+    Write-Host $logEntry
+    Add-Content -Path $LogPath -Value $logEntry
+}
+
+function Test-OneDriveInstalled {
+    try {
+        # Multiple ways to check OneDrive installation
+        $oneDriveExe = "$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe"
+        $oneDriveProcess = Get-Process -Name "OneDrive" -ErrorAction SilentlyContinue
+        $oneDriveRegistry = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\OneDrive" -ErrorAction SilentlyContinue
+        $oneDriveService = Get-Service -Name "OneDrive Updater Service" -ErrorAction SilentlyContinue
+        
+        # Check if executable exists OR process is running OR registry key exists OR service exists
+        $isInstalled = (Test-Path $oneDriveExe) -or 
+                      ($oneDriveProcess -ne $null) -or 
+                      ($oneDriveRegistry -ne $null) -or 
+                      ($oneDriveService -ne $null)
+        
+        if ($isInstalled) {
+            Write-Log "OneDrive installation detected via: $(if (Test-Path $oneDriveExe) {'executable '})$(if ($oneDriveProcess) {'process '})$(if ($oneDriveRegistry) {'registry '})$(if ($oneDriveService) {'service'})"
+        }
+        
+        return $isInstalled
+    } catch {
+        Write-Log "Error checking OneDrive installation: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+}
+
+function Enable-OneDriveKnownFolderMove {
+    param([string]$TenantID)
+    Write-Log "Configuring OneDrive Known Folder Move with TenantID: $TenantID"
+    
+    try {
+        $OneDrivePolicyKey = "HKCU:\SOFTWARE\Policies\Microsoft\OneDrive"
+        if (-not (Test-Path $OneDrivePolicyKey)) { 
+            New-Item -Path $OneDrivePolicyKey -Force | Out-Null 
+        }
+        
+        # Set KFM policies with proper tenant ID
+        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMOptInWithWizard" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMSilentOptIn" -Value $TenantID -Type String -Force
+        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMSilentOptInDesktop" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMSilentOptInDocuments" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMSilentOptInPictures" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMBlockOptOut" -Value 1 -Type DWord -Force
+        
+        Write-Log "OneDrive Known Folder Move policy configured successfully"
+        return $true
+    } catch {
+        Write-Log "Failed to configure OneDrive KFM: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+}
+
+function Remove-FolderRedirection {
+    Write-Log "Removing folder redirection and resetting to local paths"
+    
+    try {
+        $regPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        
+        if (-not (Test-Path $regPath)) {
+            Write-Log "Registry path for shell folders does not exist" -Level "WARN"
+            return $false
+        }
+        
+        # Reset all folders to local paths
+        $folderMappings = @{
+            "Personal" = "%USERPROFILE%\Documents"
+            "My Pictures" = "%USERPROFILE%\Pictures" 
+            "My Videos" = "%USERPROFILE%\Videos"
+            "My Music" = "%USERPROFILE%\Music"
+            "Favorites" = "%USERPROFILE%\Favorites"
+            "Desktop" = "%USERPROFILE%\Desktop"
+        }
+        
+        foreach ($folder in $folderMappings.GetEnumerator()) {
+            try {
+                if ($WhatIf) {
+                    Write-Log "WHATIF: Would set $($folder.Key) to $($folder.Value)" -Level "INFO"
+                } else {
+                    Set-ItemProperty -Path $regPath -Name $folder.Key -Value $folder.Value -Force -ErrorAction Stop
+                    Write-Log "Reset $($folder.Key) to local path: $($folder.Value)"
+                }
+            } catch {
+                Write-Log "Failed to reset $($folder.Key): $($_.Exception.Message)" -Level "WARN"
+            }
+        }
+        
+        # Refresh Explorer to pick up changes
+        if (-not $WhatIf) {
+            try {
+                $signature = @'
+[DllImport("shell32.dll")]
+public static extern void SHChangeNotify(uint wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+'@
+                $type = Add-Type -MemberDefinition $signature -Name Win32Utils -Namespace SHChangeNotify -PassThru -ErrorAction SilentlyContinue
+                if ($type) {
+                    $type::SHChangeNotify(0x8000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+                    Write-Log "Explorer shell refreshed via API"
+                } else {
+                    throw "Failed to load Win32 API"
+                }
+            } catch {
+                Write-Log "Could not refresh shell via API, attempting Explorer restart: $($_.Exception.Message)" -Level "WARN"
+                try {
+                    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 3
+                    Start-Process explorer.exe -ErrorAction Stop
+                    Write-Log "Explorer restarted successfully"
+                } catch {
+                    Write-Log "Failed to restart Explorer: $($_.Exception.Message)" -Level "ERROR"
+                }
+            }
+        }
+        return $true
+    } catch {
+        Write-Log "Error in Remove-FolderRedirection: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+}
+
+function Copy-HdriveData {
+    param([string]$SourcePath, [string]$DestinationPath)
+    if (-not (Test-Path $SourcePath)) {
+        Write-Log "Source path does not exist: $SourcePath" -Level "WARN"
+        return $false
+    }
+    Write-Log "Copying data from $SourcePath to $DestinationPath (using Robocopy)"
+    
+    if (-not (Test-Path $DestinationPath)) {
+        New-Item -Path $DestinationPath -ItemType Directory -Force | Out-Null
+    }
+
+    $logfile = Join-Path $env:TEMP "robocopy-$(Get-Date -Format 'yyyyMMddHHmmss').log"
+
+    # /E : copy subdirectories, including Empty ones
+    # /Z : restartable mode (network resilience)
+    # /R:3 /W:5 : 3 retries, 5 sec wait
+    # /NFL /NDL : omit file/dir lists unless you want all verbose
+    # /NP : no per-file progress (suppress only if you want minimal output)
+    # Remove /NFL/NDL and /NP if you want maximum detail!
+    $args = @(
+        """$SourcePath""", """$DestinationPath""",
+        '/E', '/Z', '/V',
+        '/R:3', '/W:5',
+        '/TEE', "/LOG+:$logfile"
+    )
+
+    $proc = Start-Process -FilePath 'robocopy.exe' -ArgumentList $args -Wait -NoNewWindow -PassThru
+    $exitCode = $proc.ExitCode
+
+    # Robocopy exit codes: https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/robocopy#return-codes
+    if ($exitCode -lt 8) {
+        Write-Log "Robocopy completed successfully from $SourcePath to $DestinationPath. Log: $logfile"
+        return $true
+    } else {
+        Write-Log "Robocopy encountered errors (exit code $exitCode). See log: $logfile" -Level "ERROR"
+        return $false
+    }
+}
+
+
+
+function Start-OneDriveProcess {
+    Write-Log "Starting OneDrive process"
+    
+    try {
+        $oneDrivePath = "${env:LOCALAPPDATA}\Microsoft\OneDrive\OneDrive.exe"
+        
+        if (-not (Test-Path $oneDrivePath)) {
+            Write-Log "OneDrive executable not found at $oneDrivePath" -Level "ERROR"
+            return $false
+        }
+        
+        if ($WhatIf) {
+            Write-Log "WHATIF: Would start OneDrive process" -Level "INFO"
+            return $true
+        }
+        
+        # Check if OneDrive is already running
+        $existingProcess = Get-Process -Name "OneDrive" -ErrorAction SilentlyContinue
+        if ($existingProcess) {
+            Write-Log "OneDrive is already running (PID: $($existingProcess.Id))"
+            return $true
+        }
+        
+        Start-Process -FilePath $oneDrivePath -WindowStyle Hidden -ErrorAction Stop
+        Write-Log "OneDrive process started successfully"
+        Start-Sleep -Seconds 10  # Allow OneDrive to initialize
+        
+        # Verify process started
+        $newProcess = Get-Process -Name "OneDrive" -ErrorAction SilentlyContinue
+        if ($newProcess) {
+            Write-Log "OneDrive process confirmed running (PID: $($newProcess.Id))"
+            return $true
+        } else {
+            Write-Log "OneDrive process may not have started properly" -Level "WARN"
+            return $false
+        }
+    } catch {
+        Write-Log "Error starting OneDrive process: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+}
+
+# Parameter validation - only validate if TenantID is provided
+if ([string]::IsNullOrWhiteSpace($TenantID)) {
+    Write-Log "No TenantID provided - OneDrive KFM configuration will be skipped" -Level "WARN"
+    $SkipKFM = $true
+} elseif ($TenantID -match "^<.*>$" -or $TenantID -eq "00000000-0000-0000-0000-000000000000") {
+    Write-Error "Invalid TenantID provided. Please specify a valid Office 365 Tenant GUID."
+    Write-Error "Example: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    exit 1
+} elseif (-not ($TenantID -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')) {
+    Write-Error "TenantID format is invalid. Must be a valid GUID format."
+    exit 1
+} else {
+    $SkipKFM = $false
+}
+
+# Main execution
+Write-Log "=== OneDrive Migration Script Started ===" -Level "INFO"
+Write-Log "Parameters: WhatIf=$WhatIf, LogPath=$LogPath, TenantID=$TenantID"
+
+# Pre-flight checks
+if (-not (Test-OneDriveInstalled)) {
+    Write-Log "OneDrive is not properly installed on this system" -Level "ERROR"
+    Write-Log "Please install OneDrive before running this migration script" -Level "ERROR"
+    exit 1
+}
+
+# Check current user environment
+$currentUser = $env:USERNAME
+$homeShare = $env:HOMESHARE
+$homePath = $env:HOMEPATH
+Write-Log "Current user: $currentUser"
+Write-Log "Home share: $homeShare"
+Write-Log "Home path: $homePath"
+
+# Step 1: Remove folder redirection
+$redirectionResult = Remove-FolderRedirection
+if (-not $redirectionResult) {
+    Write-Log "Folder redirection removal failed - continuing with migration" -Level "WARN"
+}
+
+# Step 2: Configure OneDrive Known Folder Move (if TenantID provided)
+if (-not $SkipKFM) {
+    $kfmResult = Enable-OneDriveKnownFolderMove -TenantID $TenantID
+    if (-not $kfmResult) {
+        Write-Log "Failed to configure OneDrive KFM - continuing with migration" -Level "WARN"
+    }
+} else {
+    Write-Log "Skipping OneDrive KFM configuration - no TenantID provided" -Level "INFO"
+}
+
+# Step 3: Start OneDrive if not running
+$oneDriveRunning = Get-Process -Name "OneDrive" -ErrorAction SilentlyContinue
+if (-not $oneDriveRunning) {
+    $started = Start-OneDriveProcess
+    if (-not $started) {
+        Write-Log "Failed to start OneDrive - user may need to sign in manually" -Level "WARN"
+    }
+} else {
+    Write-Log "OneDrive already running"
+}
+
+# Step 4: Copy H drive data to local folders (if H drive exists)
+if ($homeShare -and $homePath) {
+    $hDrivePath = "$homeShare$homePath"
+    if (Test-Path $hDrivePath) {
+        Write-Log "H drive detected at: $hDrivePath"
+        
+        # Copy Documents
+        $sourceDocuments = $hDrivePath
+        $destDocuments = "${env:USERPROFILE}\Documents"
+        Copy-HdriveData -SourcePath $sourceDocuments -DestinationPath $destDocuments
+        
+        # Copy other folders if they exist
+        $foldersToCopy = @{
+            "Pictures" = "${env:USERPROFILE}\Pictures"
+            "Videos" = "${env:USERPROFILE}\Videos"  
+            "Music" = "${env:USERPROFILE}\Music"
+            "Favorites" = "${env:USERPROFILE}\Favorites"
+        }
+        
+        foreach ($folder in $foldersToCopy.GetEnumerator()) {
+            $sourceFolder = Join-Path $hDrivePath $folder.Key
+            if (Test-Path $sourceFolder) {
+                Copy-HdriveData -SourcePath $sourceFolder -DestinationPath $folder.Value
+            }
+        }
+    } else {
+        Write-Log "H drive path not accessible: $hDrivePath" -Level "WARN"
+    }
+} else {
+    Write-Log "No H drive environment variables detected" -Level "INFO"
+}
+
+
+function Validate-OneDriveKFMRegistry {
+    param([string]$ExpectedTenantID)
+
+    try {
+        $regPath = "HKCU:\SOFTWARE\Policies\Microsoft\OneDrive"
+        if (-not (Test-Path $regPath)) {
+            Write-Log "OneDrive policy registry path does not exist" -Level "WARN"
+            return $false
+        }
+        
+        $expected = @{
+            "KFMSilentOptIn"          = $ExpectedTenantID
+            "KFMSilentOptInDocuments" = 1
+            "KFMSilentOptInPictures"  = 1
+            "KFMSilentOptInDesktop"   = 1
+            "KFMBlockOptOut"          = 1
+        }
+        
+        $allGood = $true
+        Write-Log "Validating OneDrive KFM Registry settings..."
+        
+        foreach ($key in $expected.Keys) {
+            $actual = (Get-ItemProperty -Path $regPath -Name $key -ErrorAction SilentlyContinue).$key
+            if ($actual -ne $expected[$key]) {
+                Write-Log "Registry mismatch: $key should be '$($expected[$key])', found '$actual'" -Level "WARN"
+                $allGood = $false
+            } else {
+                Write-Log "Registry OK: $key = $actual"
+            }
+        }
+        
+        if ($allGood) {
+            Write-Log "All OneDrive KFM registry values validated successfully"
+        } else {
+            Write-Log "One or more KFM registry values are incorrect or missing" -Level "WARN"
+        }
+        return $allGood
+    } catch {
+        Write-Log "Error validating OneDrive KFM registry: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+}
+
+
+
+# Step 5: Validate configuration and restart OneDrive (if KFM was configured)
+if (-not $SkipKFM) {
+    $validationResult = Validate-OneDriveKFMRegistry -ExpectedTenantID $TenantID
+} else {
+    $validationResult = $true
+    Write-Log "Skipping KFM registry validation - no TenantID provided" -Level "INFO"
+}
+
+if ($validationResult) {
+    Write-Log "Registry validation passed - restarting OneDrive to apply policies"
+    
+    if (-not $WhatIf) {
+        try {
+            Get-Process "OneDrive" -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 5
+            $oneDriveExe = "$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe"
+            if (Test-Path $oneDriveExe) { 
+                Start-Process $oneDriveExe 
+                Write-Log "OneDrive restarted successfully"
+            }
+        } catch {
+            Write-Log "Failed to restart OneDrive: $($_.Exception.Message)" -Level "WARN"
+        }
+    }
+} else {
+    Write-Log "Registry validation failed - manual intervention may be required" -Level "WARN"
+}
+
+# Step 6: Final status
+Write-Log "=== Migration Steps Completed ===" -Level "INFO"
+Write-Log "Next manual steps for user:"
+Write-Log "1. Sign into OneDrive if not already signed in"  
+Write-Log "2. Verify Known Folder Move is working (check OneDrive settings)"
+Write-Log "3. Wait for initial sync to complete"
+Write-Log "4. Verify all data is accessible through OneDrive"
+
+if (-not $WhatIf) {
+    Write-Log "Migration completed. Log saved to: $LogPath"
+    Write-Host "`nMigration completed successfully!" -ForegroundColor Green
+    Write-Host "Log file: $LogPath" -ForegroundColor Yellow
+    Write-Host "`nPlease ensure user signs into OneDrive and verifies sync is working." -ForegroundColor Cyan
+}
