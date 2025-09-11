@@ -220,7 +220,7 @@ Add-Type -AssemblyName System.Windows.Forms
         $ScriptBlock | Out-File -FilePath $TaskScriptPath -Encoding UTF8 -Force
 
         # Create the scheduled task trigger (monthly on the 15th at 2 PM)
-        $Trigger = New-ScheduledTaskTrigger -Monthly -DaysOfMonth 15 -At "2:00 PM"
+        $Trigger = New-ScheduledTaskTrigger -Once -At "2:00 PM" -RepetitionInterval (New-TimeSpan -Days 30)
 
         # Create the action
         $Action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TaskScriptPath`""
