@@ -14,8 +14,13 @@
     Requires: PowerShell 5.1+, Windows 10
 #>
 
-# Set execution policy for this session
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned -Force
+# Set execution policy for this session - enhanced for automated execution
+try {
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+    Write-Log "Execution policy set to Bypass for this session"
+} catch {
+    Write-Log "Warning: Could not set execution policy: $($_.Exception.Message)" "WARN"
+}
 
 # Script configuration
 $ScriptName = "Win11UpgradeScript"
@@ -33,22 +38,29 @@ function Write-Log {
     Add-Content -Path $LogPath -Value $LogEntry
 }
 
-# Function to show user notifications
+# Function to show user notifications - modified for headless operation
 function Show-UserNotification {
     param(
         [string]$Title,
         [string]$Message,
-        [string]$Icon = "Information"
+        [string]$Icon = "Information",
+        [bool]$SilentMode = $true
     )
+
+    # In automated/headless mode, only log notifications
+    if ($SilentMode -or $env:AUTOMATED_EXECUTION -eq "true") {
+        Write-Log "NOTIFICATION: [$Title] $Message" "INFO"
+        return
+    }
 
     try {
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.MessageBox]::Show($Message, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::$Icon)
     }
     catch {
-        # Fixed: Proper string concatenation for fallback notification
         $NotificationText = "$Title - $Message"
         Write-Host $NotificationText -ForegroundColor Yellow
+        Write-Log "NOTIFICATION: $NotificationText" "INFO"
     }
 }
 
@@ -153,7 +165,8 @@ function Start-Win11Upgrade {
     Write-Log "Starting Windows 11 upgrade process"
 
     try {
-        # Show initial notification
+        # Log upgrade start (no user interaction in automated mode)
+        Write-Log "Starting Windows 11 upgrade - device is compatible"
         Show-UserNotification -Title "Windows 11 Upgrade" -Message "Your device is compatible with Windows 11. Starting upgrade process. This may take some time and will require restarts."
 
         # Download Windows 11 Installation Assistant
@@ -165,12 +178,12 @@ function Start-Win11Upgrade {
         if (Test-Path $AssistantPath) {
             Write-Log "Installation Assistant downloaded successfully"
 
-            # Run the upgrade with silent parameters
-            Write-Log "Launching Windows 11 Installation Assistant"
-            $ProcessArgs = "/quietinstall /skipeula /auto upgrade /NoRestartUI /copylogs $env:TEMP"
-            Start-Process -FilePath $AssistantPath -ArgumentList $ProcessArgs -Wait
+            # Run the upgrade with silent parameters for automated execution
+            Write-Log "Launching Windows 11 Installation Assistant with silent parameters"
+            $ProcessArgs = "/quietinstall /skipeula /auto upgrade /NoRestartUI /copylogs $env:TEMP /silent"
+            Start-Process -FilePath $AssistantPath -ArgumentList $ProcessArgs -NoNewWindow
 
-            Write-Log "Windows 11 upgrade initiated successfully"
+            Write-Log "Windows 11 upgrade initiated successfully - running in background"
             Show-UserNotification -Title "Windows 11 Upgrade" -Message "Windows 11 upgrade has been initiated. Your computer will restart automatically when ready."
         }
         else {
@@ -220,8 +233,9 @@ Add-Type -AssemblyName System.Windows.Forms
 
         Write-Log "Monthly alert task created successfully"
 
-        # Show appropriate notification based on whether this is initial run
+        # Log compatibility status (automated mode)
         if ($IsInitialRun) {
+            Write-Log "System incompatible with Windows 11 - monthly alerts configured"
             Show-UserNotification -Title "Windows 11 Compatibility" -Message "Your computer does not meet Windows 11 requirements. You will receive monthly reminders about this. Consider upgrading hardware or contact IT support." -Icon "Warning"
         }
 
@@ -252,7 +266,7 @@ function Main {
     
     # Check if already on Windows 11
     if ($BuildNumber -ge 22000) {
-        Write-Log "System is already running Windows 11 (Build $BuildNumber)"
+        Write-Log "System is already running Windows 11 (Build $BuildNumber) - no action needed"
         Show-UserNotification -Title "Windows 11 Status" -Message "This computer is already running Windows 11. No upgrade needed." -Icon "Information"
         Write-Log "=== Windows 11 Upgrade Script Completed ==="
         return
@@ -274,8 +288,9 @@ function Main {
                 Start-Win11Upgrade
             }
             else {
-                Write-Log "Administrator rights required for upgrade. Prompting user."
-                Show-UserNotification -Title "Windows 11 Upgrade Available" -Message "Your computer is compatible with Windows 11. Please run this script as administrator to begin the upgrade." -Icon "Information"
+                Write-Log "Administrator rights required for upgrade - cannot proceed in automated mode" "ERROR"
+                Show-UserNotification -Title "Windows 11 Upgrade Available" -Message "Your computer is compatible with Windows 11. Administrator rights required for upgrade." -Icon "Information"
+                exit 1
             }
         }
         1 {
