@@ -4,6 +4,22 @@ A collection of PowerShell scripts for Windows system administration, specifical
 
 ## Scripts Overview
 
+### 🖥️ Windows 11 Deployment
+
+#### win11_deploy_simple.bat
+Simple Windows 11 upgrade deployment script that downloads and runs the official upgrade script from a secure source. Designed to be lightweight and avoid antivirus false positives.
+
+**Features:**
+- Downloads Windows 11 upgrade script from secure URL
+- Sets proper PowerShell execution policy temporarily
+- Clean, minimal approach to avoid antivirus detection
+- Automatic cleanup after execution
+
+**Usage:**
+```batch
+win11_deploy_simple.bat
+```
+
 ### 🚀 Complete-OneDrive-Migration.ps1 (RECOMMENDED)
 **The comprehensive, all-in-one solution** that combines functionality from all other scripts into a single, optimized tool.
 
