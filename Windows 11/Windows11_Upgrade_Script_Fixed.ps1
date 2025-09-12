@@ -19,14 +19,6 @@
     - Added override recommendations for business decisions
 #>
 
-# Set execution policy for this session - enhanced for automated execution
-try {
-    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-    Write-Log "Execution policy set to Bypass for this session"
-} catch {
-    Write-Log "Warning: Could not set execution policy: $($_.Exception.Message)" "WARN"
-}
-
 # Script configuration
 $ScriptName = "Win11UpgradeScript"
 $LogPath = "$env:TEMP\Win11Upgrade.log"
@@ -41,6 +33,14 @@ function Write-Log {
     $LogEntry = "[$TimeStamp] [$Level] $Message"
     Write-Host $LogEntry
     Add-Content -Path $LogPath -Value $LogEntry
+}
+
+# Set execution policy for this session - enhanced for automated execution
+try {
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+    Write-Log "Execution policy set to Bypass for this session"
+} catch {
+    Write-Log "Warning: Could not set execution policy: $($_.Exception.Message)" "WARN"
 }
 
 # Function to show user notifications - modified for headless operation
@@ -61,8 +61,7 @@ function Show-UserNotification {
     try {
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.MessageBox]::Show($Message, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::$Icon)
-    }
-    catch {
+    } catch {
         $NotificationText = "$Title - $Message"
         Write-Host $NotificationText -ForegroundColor Yellow
         Write-Log "NOTIFICATION: $NotificationText" "INFO"
@@ -82,9 +81,9 @@ function Test-BasicWin11Requirements {
         $HasTPM = $TPM -and $TPM.SpecVersion -like "2.*"
         
         if ($HasTPM) {
-            Write-Log "✓ TPM 2.0 available: YES (Version: $($TPM.SpecVersion))"
+            Write-Log "? TPM 2.0 available: YES (Version: $($TPM.SpecVersion))"
         } else {
-            Write-Log "✗ TPM 2.0 available: NO"
+            Write-Log "? TPM 2.0 available: NO"
             $CompatibilityIssues += "TPM 2.0 not found or not version 2.0"
             $IsCompatible = $false
         }
@@ -99,9 +98,9 @@ function Test-BasicWin11Requirements {
         }
         
         if ($SecureBoot) {
-            Write-Log "✓ Secure Boot enabled: YES"
+            Write-Log "? Secure Boot enabled: YES"
         } else {
-            Write-Log "✗ Secure Boot enabled: NO"
+            Write-Log "? Secure Boot enabled: NO"
             $CompatibilityIssues += "Secure Boot is not enabled"
             $IsCompatible = $false
         }
@@ -111,9 +110,9 @@ function Test-BasicWin11Requirements {
         $HasEnoughRAM = $RAM -ge 4
         
         if ($HasEnoughRAM) {
-            Write-Log "✓ RAM: $([math]::Round($RAM, 1))GB (Required: 4GB+) - SUFFICIENT"
+            Write-Log "? RAM: $([math]::Round($RAM, 1))GB (Required: 4GB+) - SUFFICIENT"
         } else {
-            Write-Log "✗ RAM: $([math]::Round($RAM, 1))GB (Required: 4GB+) - INSUFFICIENT"
+            Write-Log "? RAM: $([math]::Round($RAM, 1))GB (Required: 4GB+) - INSUFFICIENT"
             $CompatibilityIssues += "Insufficient RAM: $([math]::Round($RAM, 1))GB (minimum 4GB required)"
             $IsCompatible = $false
         }
@@ -128,9 +127,9 @@ function Test-BasicWin11Requirements {
         $HasEnoughSpace = $FreeSpaceGB -ge 64
         
         if ($HasEnoughSpace) {
-            Write-Log "✓ Storage space: ${FreeSpaceGB}GB free (Required: 64GB+) - SUFFICIENT"
+            Write-Log "? Storage space: ${FreeSpaceGB}GB free (Required: 64GB+) - SUFFICIENT"
         } else {
-            Write-Log "✗ Storage space: ${FreeSpaceGB}GB free (Required: 64GB+) - INSUFFICIENT"
+            Write-Log "? Storage space: ${FreeSpaceGB}GB free (Required: 64GB+) - INSUFFICIENT"
             $CompatibilityIssues += "Insufficient storage space: ${FreeSpaceGB}GB free (minimum 64GB required)"
             $IsCompatible = $false
         }
@@ -140,9 +139,9 @@ function Test-BasicWin11Requirements {
             $FirmwareType = (Get-WmiObject -Class Win32_ComputerSystem).PCSystemType
             $IsUEFI = Test-Path "$env:SystemDrive\EFI"
             if ($IsUEFI) {
-                Write-Log "✓ UEFI firmware: YES"
+                Write-Log "? UEFI firmware: YES"
             } else {
-                Write-Log "✗ UEFI firmware: NO (Legacy BIOS detected)"
+                Write-Log "? UEFI firmware: NO (Legacy BIOS detected)"
                 $CompatibilityIssues += "Legacy BIOS detected (UEFI firmware required)"
                 $IsCompatible = $false
             }
@@ -165,8 +164,7 @@ function Test-BasicWin11Requirements {
             Write-Log "OVERRIDE RECOMMENDATION: Review issues above. TPM and Secure Boot can sometimes be enabled in BIOS. RAM and storage upgrades may be cost-effective." "WARN"
             return 1
         }
-    }
-    catch {
+    } catch {
         Write-Log "Error during basic compatibility check: $($_.Exception.Message)" "ERROR"
         return -1
     }
@@ -198,9 +196,9 @@ function Test-Win11Compatibility {
                 Write-Log "=== MICROSOFT HARDWARE READINESS OUTPUT ==="
                 foreach ($Line in $Result) {
                     if ($Line -match "FAIL|ERROR|NOT COMPATIBLE|REQUIREMENT") {
-                        Write-Log "  ✗ $Line" "ERROR"
+                        Write-Log "  ? $Line" "ERROR"
                     } elseif ($Line -match "PASS|SUCCESS|COMPATIBLE|MEETS") {
-                        Write-Log "  ✓ $Line" "INFO"
+                        Write-Log "  ? $Line" "INFO"
                     } elseif ($Line.ToString().Trim() -ne "") {
                         Write-Log "  $Line" "INFO"
                     }
@@ -232,15 +230,13 @@ function Test-Win11Compatibility {
             # Clean up temp file
             Remove-Item $TempScript -Force -ErrorAction SilentlyContinue
             return $ExitCode
-        }
-        catch {
+        } catch {
             Write-Log "Error executing HardwareReadiness.ps1: $($_.Exception.Message)" "ERROR"
             Write-Log "Falling back to basic compatibility check" "WARN"
             Remove-Item $TempScript -Force -ErrorAction SilentlyContinue
             return Test-BasicWin11Requirements
         }
-    }
-    catch {
+    } catch {
         Write-Log "Error during compatibility check: $($_.Exception.Message)" "ERROR"
         Write-Log "Falling back to basic compatibility check" "WARN"
         return Test-BasicWin11Requirements
@@ -276,8 +272,7 @@ function Start-Win11Upgrade {
         else {
             throw "Failed to download Installation Assistant"
         }
-    }
-    catch {
+    } catch {
         Write-Log "Error during upgrade process: $($_.Exception.Message)" "ERROR"
         Show-UserNotification -Title "Upgrade Error" -Message "Failed to start Windows 11 upgrade. Check logs at $LogPath" -Icon "Error"
     }
@@ -310,7 +305,7 @@ Add-Type -AssemblyName System.Windows.Forms
         $Trigger = New-ScheduledTaskTrigger -Once -At "2:00 PM" -RepetitionInterval (New-TimeSpan -Days 30)
 
         # Create the action
-        $Action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"`$TaskScriptPath`""
+        $Action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TaskScriptPath`""
 
         # Create task principal (run as current user)
         $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Limited
@@ -326,8 +321,7 @@ Add-Type -AssemblyName System.Windows.Forms
             Show-UserNotification -Title "Windows 11 Compatibility" -Message "Your computer does not meet Windows 11 requirements. You will receive monthly reminders about this. Consider upgrading hardware or contact IT support." -Icon "Warning"
         }
 
-    }
-    catch {
+    } catch {
         Write-Log "Error creating scheduled task: $($_.Exception.Message)" "ERROR"
     }
 }
