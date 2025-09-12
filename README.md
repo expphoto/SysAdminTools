@@ -2,6 +2,12 @@
 
 A collection of PowerShell scripts for Windows system administration, specifically focused on OneDrive migration and folder redirection management.
 
+## Folders
+
+- `Patching/` — Interactive Windows patching automation with WSUS‑friendly SYSTEM install path and live monitor mode. See `Patching/README.md`.
+- `Windows 11/` — Windows 11 upgrade tooling; universal script supports forced upgrades with registry bypasses. See `Windows 11/README.md`.
+- `OneDrive/` — OneDrive migration and folder redirection cleanup, including a combined end‑to‑end migration script. See `OneDrive/README.md`.
+
 ## Patching At A Glance
 
 See `Patching/README.md` for full details on the interactive patching automation.

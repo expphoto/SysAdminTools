@@ -22,7 +22,12 @@ param(
     [switch]$UseLocalAccount,
     [switch]$RepairWindowsUpdate,
     [switch]$TestMode,
-    [switch]$QuickTest
+    [switch]$QuickTest,
+    # Auto mode: fully non-interactive run (requires servers + creds)
+    [switch]$Auto,
+    # If installs show no progress for a period, reboot to break locks
+    [switch]$AutoRebootOnHang,
+    [int]$HangThresholdMinutes = 45
 )
 
 $script:StartTime = Get-Date
@@ -110,6 +115,11 @@ function Show-Banner {
     
     if ($TestMode) {
         Write-Host "*** TEST MODE ENABLED - No actual changes will be made ***" -ForegroundColor Yellow -BackgroundColor Red
+        Write-Host ""
+    }
+    if ($Auto) {
+        Write-Host "AUTO MODE ENABLED - Non-interactive run" -ForegroundColor Yellow
+        Write-Host "Prompts are suppressed; will exit automatically" -ForegroundColor Yellow
         Write-Host ""
     }
 }
@@ -613,6 +623,27 @@ $RepairWUScript = {
     return $out
 }
 
+# Update progress heuristic (runs on remote): returns whether a reboot may help
+$UpdateHangHeuristic = {
+    param([int]$ThresholdMinutes = 45)
+    $obj = [PSCustomObject]@{ ShouldReboot=$false; Details=@() }
+    try {
+        $since = (Get-Date).AddMinutes(-[int]$ThresholdMinutes)
+        $log = 'Microsoft-Windows-WindowsUpdateClient/Operational'
+        $evts = @(Get-WinEvent -ErrorAction SilentlyContinue -FilterHashtable @{ LogName=$log; StartTime=$since })
+        $started = $evts | Where-Object { $_.Id -eq 34 } | Sort-Object TimeCreated | Select-Object -Last 1
+        $success = $evts | Where-Object { $_.Id -eq 19 } | Sort-Object TimeCreated | Select-Object -Last 1
+        $failed  = $evts | Where-Object { $_.Id -eq 20 } | Sort-Object TimeCreated | Select-Object -Last 1
+        $download= $evts | Where-Object { $_.Id -eq 31 } | Sort-Object TimeCreated | Select-Object -Last 1
+        if ($started -and -not $success -and -not $failed) { $obj.ShouldReboot = $true; $obj.Details += 'Install started without outcome in window' }
+        elseif ($download -and -not $success -and -not $failed) { $obj.ShouldReboot = $true; $obj.Details += 'Download seen without install outcome in window' }
+        elseif (-not $evts -or $evts.Count -eq 0) { $obj.ShouldReboot = $true; $obj.Details += 'No WU activity observed in window' }
+    } catch {
+        $obj.Details += ('Heuristic error: ' + $_.Exception.Message)
+    }
+    return $obj
+}
+
 # Main script execution
 Show-Banner
 
@@ -620,15 +651,25 @@ try {
     # Phase 1: Get server list
     Write-Log "Starting Working Interactive Patching Automation" "SUCCESS"
     if ($null -ne $Servers -and $Servers.Count -gt 0) {
-        $servers = $Servers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() }
-        Write-Host "Using servers from parameters: $($servers -join ', ')" -ForegroundColor Cyan
+        # In Auto mode, allow passing a single file path via -Servers
+        if ($Auto -and $Servers.Count -eq 1 -and (Test-Path -LiteralPath $Servers[0])) {
+            $servers = Get-Content -LiteralPath $Servers[0] | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() }
+            Write-Host "Using servers from file: $($Servers[0])" -ForegroundColor Cyan
+        } else {
+            $servers = $Servers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() }
+            Write-Host "Using servers from parameters: $($servers -join ', ')" -ForegroundColor Cyan
+        }
     } else {
+        if ($Auto) {
+            Write-Log "Auto mode requires -Servers (list or file path)." "ERROR"
+            exit 1
+        }
         $servers = Get-ServersFromInput
     }
     
     if ($servers.Count -eq 0) {
         Write-Log "No servers to process - exiting" "ERROR"
-        Read-Host "Press Enter to exit"
+        if (-not $Auto) { Read-Host "Press Enter to exit" }
         exit 1
     }
     
@@ -652,10 +693,14 @@ try {
             Write-Log "Using provided credentials for all servers: $fullUser" "INFO"
         }
     } else {
+        if ($Auto) {
+            Write-Log "Auto mode requires credentials via -Username and -Password (and optional -Domain or DOMAIN\\user in -Username)." "ERROR"
+            exit 1
+        }
         $credential = Get-DomainCredentials
         if (-not $credential) {
             Write-Log "Failed to obtain credentials - exiting" "ERROR"
-            Read-Host "Press Enter to exit"
+            if (-not $Auto) { Read-Host "Press Enter to exit" }
             exit 1
         }
     }
@@ -678,13 +723,19 @@ try {
     }
     Write-Host ""
     
-    if (-not $QuickTest) {
+    if (-not $QuickTest -and -not $Auto) {
         $confirm = Read-Host "Continue with processing? (Y/N)"
         if ($confirm -notmatch '^y|yes$') {
             Write-Log "Processing cancelled by user" "WARN"
             Export-TargetsReport -Targets $servers -Reason 'UserCancelledAtConfirmation' | Out-Null
             exit 0
         }
+    }
+    
+    # Auto mode: best-effort behavior
+    if ($Auto) {
+        $RepairWindowsUpdate = $true
+        if (-not $PSBoundParameters.ContainsKey('AutoRebootOnHang')) { $AutoRebootOnHang = $true }
     }
     
     # Configure local WinRM TrustedHosts (optional, requires admin)
@@ -784,7 +835,7 @@ try {
     
     if ($reachableServers.Count -eq 0) {
         Write-Log "No servers are reachable. Check connectivity, credentials, and network access." "ERROR"
-        Read-Host "Press Enter to exit"
+        if (-not $Auto) { Read-Host "Press Enter to exit" }
         exit 1
     }
     
@@ -795,7 +846,7 @@ try {
         Write-Log "Quick connectivity test completed successfully!" "SUCCESS"
         Write-Host ""
         Write-Host "All systems are ready for full automation!" -ForegroundColor Green
-        Read-Host "Press Enter to exit"
+        if (-not $Auto) { Read-Host "Press Enter to exit" }
         exit 0
     }
     
@@ -1033,6 +1084,34 @@ try { $result | ConvertTo-Json -Depth 5 | Out-File -FilePath $OutPath -Encoding 
                                 Write-Log "     Post-install analysis: Updates=$($analysis2.UpdatesTotal) Reboot=$($analysis2.PendingReboot) Disk=$($analysis2.DiskSpaceGB)GB" "INFO"
                                 $remediation.Analysis = $analysis2
                             } catch {}
+                            # If still not clear and no explicit reboot pending, consider hang heuristic
+                            if (-not $TestMode -and $AutoRebootOnHang -and $analysis.UpdatesTotal -gt 0 -and -not $analysis.PendingReboot) {
+                                try {
+                                    $h = Invoke-Command -Session $session -ScriptBlock $UpdateHangHeuristic -ArgumentList $HangThresholdMinutes
+                                    if ($h) {
+                                        if ($h.Details) { foreach($d in $h.Details){ Write-Log ("     HEUR: " + $d) "INFO" } }
+                                        if ($h.ShouldReboot) {
+                                            Write-Log "     Heuristic suggests updates are stuck ~${HangThresholdMinutes}m; initiating reboot." "WARN"
+                                            try {
+                                                $credForReboot = if ($credentialMap.ContainsKey($server)) { $credentialMap[$server] } else { $credential }
+                                                Restart-Computer -ComputerName $server -Credential $credForReboot -Force -ErrorAction Stop
+                                                $remediation.ActionsPerformed += "Auto-reboot on hang (${HangThresholdMinutes}m no progress)"
+                                                $analysis.PendingReboot = $true
+                                                $waitSecs = [Math]::Max(120, $RebootWaitMinutes * 60)
+                                                if (Wait-ForServerOnline -Server $server -Credential $credForReboot -TimeoutSeconds $waitSecs -PollSeconds 15) {
+                                                    Write-Log "     $server is back online after hang reboot." "SUCCESS"
+                                                } else {
+                                                    Write-Log "     $server did not return within wait window after hang reboot." "WARN"
+                                                }
+                                            } catch {
+                                                Write-Log ("     Auto-reboot on hang failed: " + $_.Exception.Message) "ERROR"
+                                            }
+                                        }
+                                    }
+                                } catch {
+                                    Write-Log ("     Hang heuristic check failed: " + $_.Exception.Message) "WARN"
+                                }
+                            }
                         }
                     }
                     

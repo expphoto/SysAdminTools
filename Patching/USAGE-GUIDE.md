@@ -20,6 +20,19 @@
 # Script handles everything else automatically
 ```
 
+**Unattended usage (`-Auto`):**
+```powershell
+# Inline servers
+.\interactive-patching-automation.ps1 -Auto -Servers 'srv1','srv2' -Username 'CONTOSO\\svc_patch' -Password 'P@ssw0rd!'
+
+# Servers from file
+.\interactive-patching-automation.ps1 -Auto -Servers .\servers-example.txt -Username 'CONTOSO\\svc_patch' -Password 'P@ssw0rd!'
+```
+Notes:
+- Auto mode skips prompts and final pause; suitable for scheduled runs.
+- Auto mode enables Windows Update repair on failure automatically.
+- With `-AutoRebootOnHang`, the script reboots targets that show no Windows Update progress for the threshold window (default 45 minutes). You can tune with `-HangThresholdMinutes`.
+
 #### `simple-patching-automation.ps1` 
 **Streamlined version for direct server list input**
 - **Command-line parameters** - Specify servers directly

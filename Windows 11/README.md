@@ -85,6 +85,36 @@ This folder contains PowerShell scripts for checking Windows 11 compatibility an
 - Storage space checks
 - UEFI requirements
 
+## Batch Launchers
+
+- `win11_check_normal.bat`: Runs `Windows11_Upgrade_Universal.ps1 -Silent` for a normal (non‑force) path.
+- `win11_deploy.bat`: Runs `Windows11_Upgrade_Universal.ps1 -Force -Silent` to initiate a forced upgrade.
+- `Force Run Paste.txt`: One‑liner to download and run the universal script with `-Force` from `%TEMP%`.
+
+## Universal Script Force Mode (How it works)
+
+`Windows11_Upgrade_Universal.ps1 -Force` applies registry bypasses and launches Microsoft’s Installation Assistant silently:
+
+- `HKLM\\SYSTEM\\Setup\\LabConfig` → `BypassTPMCheck=1`, `BypassSecureBootCheck=1`, `BypassRAMCheck=1`, `BypassCPUCheck=1`, `BypassStorageCheck=1`
+- `HKLM\\SYSTEM\\Setup\\MoSetup` → `AllowUpgradesWithUnsupportedTPMOrCPU=1`
+- Clears `AppCompatFlags` markers; sets helpful signals (e.g., `HKCU\\Software\\Microsoft\\PCHC\\UpgradeEligibility=1`)
+- Starts Installation Assistant with `/quietinstall /skipeula /auto upgrade /NoRestartUI /copylogs %TEMP%`
+
+Notes: `-Force` requires Administrator. Disk space/BitLocker/firmware realities still apply. This path does not rely on WSUS approval.
+
+## Quick Commands
+
+```bat
+:: Normal check
+win11_check_normal.bat
+
+:: Force upgrade silently
+win11_deploy.bat
+
+:: Paste into remote CMD (from Force Run Paste.txt)
+@echo off & powershell -NoP -EP Bypass -Command "iwr 'https://f001.backblazeb2.com/file/NinjaWebMedia/Windows11_Upgrade_Universal.ps1' -OutFile \"$env:TEMP\win11_universal.ps1\" -UseBasicParsing" ^& if exist "%TEMP%\win11_universal.ps1" (powershell -NoP -EP Bypass -File "%TEMP%\win11_universal.ps1" -Force ^& del "%TEMP%\win11_universal.ps1")
+```
+
 ### For Mass Deployment via ScreenConnect/RMM
 1. Upload `Windows11_Upgrade_Script_System.ps1` to your RMM tool
 2. Deploy as a script that runs with SYSTEM privileges

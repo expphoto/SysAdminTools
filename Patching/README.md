@@ -51,6 +51,10 @@ pwsh -NoProfile -File .\interactive-patching-automation.ps1 -QuickTest
 - `-CleanupTasks`: Remove scheduled task and temp files after SYSTEM run (default on).
 - `-SystemInstallTimeoutMinutes`: Max minutes to wait for SYSTEM install (default 60).
 - `-MonitorSystemInstall`: Stream live heartbeat/events during SYSTEM install (default on).
+- `-Auto`: Fully non-interactive mode. Requires `-Servers` and credentials via `-Username` and `-Password` (plus `-Domain` or include domain in `-Username` as `DOMAIN\\user`). Skips prompts, enables Windows Update repair on failure, and exits automatically.
+- `-AutoRebootOnHang`: If updates show no progress for `-HangThresholdMinutes`, reboot to break locks (defaults to on in `-Auto`).
+- `-HangThresholdMinutes`: Minutes of “no WU progress” before auto reboot (default 45).
+- `-Auto`: Fully non-interactive mode. Requires `-Servers` and credentials via `-Username` and `-Password` (plus `-Domain` or include domain in `-Username` as `DOMAIN\\user`). Skips prompts, enables Windows Update repair on failure, and exits automatically.
 
 ## What It Does
 
@@ -114,6 +118,31 @@ pwsh -NoProfile -File .\interactive-patching-automation.ps1 `
   -SystemInstallTimeoutMinutes 90
 ```
 - If you are not running your console as Administrator, the script will skip updating local WinRM TrustedHosts and log a warning. Elevate to configure TrustedHosts.
+
+## Auto Mode
+
+Run fully unattended when you already have your targets and credentials:
+
+```powershell
+# Pass servers inline
+pwsh -NoProfile -File .\interactive-patching-automation.ps1 -Auto `
+  -Servers 'srv1','srv2','10.0.0.5' `
+  -Username 'CONTOSO\\svc_patch' `
+  -Password 'P@ssw0rd!'
+
+# Or pass a file path (one server per line)
+pwsh -NoProfile -File .\interactive-patching-automation.ps1 -Auto `
+  -Servers .\servers-example.txt `
+  -Username 'CONTOSO\\svc_patch' `
+  -Password 'P@ssw0rd!'
+```
+
+Behavior in `-Auto`:
+- Skips all Read-Host prompts and final pause
+- Enables `-RepairWindowsUpdate` automatically (best-effort)
+- Reboots targets when updates require it and waits up to `RebootWaitMinutes`
+- Enables `-AutoRebootOnHang` by default; uses Windows Update event log heuristic to decide when a reboot may help (IDs like 31/34 without 19/20 within the window)
+- Exits with non-zero code if there are no servers or no reachable targets
 
 ## Changelog
 
