@@ -3,3 +3,13 @@
 
 # Custom junk files
 .dsfile
+
+# Local AI/assistant settings
+**/.claude/
+
+# Patching generated artifacts
+**/Working-*.log
+**/Working-*.csv
+
+# Windows Thumbs
+Thumbs.db
