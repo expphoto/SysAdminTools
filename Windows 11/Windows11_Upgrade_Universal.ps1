@@ -389,7 +389,7 @@ function Test-Administrator {
 function Main {
     $ModeText = if ($Force) { "FORCE MODE - Will bypass compatibility checks" } else { "Standard mode - Respects compatibility requirements" }
     Write-Log "=== Windows 11 Universal Upgrade Script Started ==="
-    Write-Log "Script version: 3.0 (Universal - RMM & ScreenConnect compatible)"
+    Write-Log "Script version: 3.1 (Universal - RMM & ScreenConnect compatible)"
     Write-Log "Mode: $ModeText"
     Write-Log "Silent mode: $Silent"
     Write-Log "Current user: $env:USERNAME"
