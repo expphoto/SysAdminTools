@@ -1,0 +1,167 @@
+Here is a comprehensive plan for the Windows Domain Orchestration project.
+
+### 1. Detailed Implementation Plan
+
+This plan outlines the architecture and strategy for creating the `Invoke-DR-AutoStart.ps1` solution, focusing on a modular, config-driven, and idempotent design using PowerShell.
+
+**A. Architecture & Core Principles**
+
+*   **PowerShell-First:** The core logic will be implemented in PowerShell 7+ for performance benefits (`ForEach-Object -Parallel`), modern syntax, and better JSON handling. The code will maintain compatibility with Windows PowerShell 5.1 where possible, with clear documentation for any version-specific features.
+*   **Modularity:** The solution will be built around PowerShell modules (`.psm1` files) as requested. This enforces separation of concerns, simplifies testing, and improves maintainability. The main `.ps1` script will be a thin orchestrator that imports and coordinates these modules.
+*   **Data-Driven Pipeline:** The script operates as a pipeline. It starts with a collection of server names, enriches this collection with data at each stage (connectivity, roles, service status), and finally passes the aggregated results to a reporting engine.
+*   **Configuration over Code:** All environment-specific settings (OUs, server name patterns, timeouts, role-to-service mappings, concurrency limits) will be externalized into JSON configuration files. This allows administrators to adapt the tool without modifying the source code.
+*   **Idempotency & Safety:** The script will produce the same outcome no matter how many times it is run. It will only attempt to start services that are not already `Running`. Safety is paramount, enforced through a mandatory `-DryRun`/`-WhatIf` mode, blast-radius controls (`-MaxServers`), and explicit confirmation prompts.
+
+**B. Concurrency and Performance**
+
+*   **Bounded Parallelism:** PowerShell's `ForEach-Object -Parallel` (PS7+) or Runspace Pools (PS5.1) will be used for concurrent server processing.
+*   **Throttle Limit:** A configurable `-ThrottleLimit` (defaulting to `30`) will control the maximum number of concurrent sessions to prevent overwhelming the network or target servers.
+*   **Backpressure:** The design inherently manages backpressure. The main thread only dispenses work as parallel jobs complete, so a set of slow servers won't cause the entire system to queue up excessive work.
+*   **Timeouts:** Aggressive but configurable timeouts will be applied at multiple levels:
+    1.  **Connectivity:** `Test-WSMan` and `Test-Connection` will have short timeouts.
+    2.  **Remote Session:** The overall `Invoke-Command` script block will have a timeout.
+    3.  **Service Start:** `Start-Service` will be wrapped in a polling loop with a per-service timeout to confirm it reaches the `Running` state.
+
+**C. Security and Credentials**
+
+*   **SSO by Default:** The script will use the current user's integrated credentials by default.
+*   **Explicit Credentials:** A `-Credential` parameter will accept a `PSCredential` object, obtained interactively via `Get-Credential` to avoid plaintext passwords in scripts or command history.
+*   **JEA (Just Enough Administration):** The remoting module (`RemoteExec.psm1`) will include a `-ConfigurationName` parameter for `Invoke-Command`. This allows the tool to connect to constrained JEA endpoints, drastically limiting the permissions granted to the script on target servers. This is the recommended approach for production.
+
+**D. Error Handling and Reporting**
+
+*   **Structured Errors:** All operations will be wrapped in `try/catch` blocks. Errors will be captured as structured objects, including the target server, the attempted action, and the specific error message.
+*   **Multi-Format Reporting:** The `Reporting` module will generate a timestamped set of reports in CSV (for spreadsheet analysis), JSON (for stateful reruns and machine parsing), and HTML (for human-readable summaries).
+*   **Exit Codes:** The script will return specific exit codes to signal the outcome to automation tools:
+    *   `0`: Success. All targeted services on all reachable servers are running.
+    *   `1`: Partial Success. Some services failed to start, or some servers were unreachable.
+    *   `2`: Critical Failure. A fatal error occurred (e.g., AD discovery failed, configuration is invalid).
+
+**E. Staged Rollout Strategy**
+
+1.  **Phase 1 (Dry Run):** Execute the script with `-DryRun -Verbose` across the entire estate. This validates AD discovery, connectivity, and role detection without making any changes. Analyze the generated reports to confirm the "plan" is accurate.
+2.  **Phase 2 (Canary Run):** Target a small, non-critical OU or a list of servers using `-Include` and a low `-MaxServers` limit. Run without `-DryRun` to perform live changes on a limited set of systems.
+3.  **Phase 3 (Full Run):** Once confident, execute the script against the full scope.
+4.  **Phase 4 (Scheduled Task):** Configure the script to run as a scheduled task, using the JSON report to monitor for regressions over time.
+
+---
+
+### 2. Module & Function Map
+
+This map details the proposed file structure and the key functions within each module.
+
+*   `powershell/Invoke-DR-AutoStart.ps1` (Orchestrator)
+    *   Handles parameter parsing (`-DryRun`, `-Credential`, `-ThrottleLimit`, etc.).
+    *   Loads configuration from `config/*.json`.
+    *   Imports modules.
+    *   Executes the main pipeline: Discover -> Test -> Detect -> Act.
+    *   Calls the reporting module to generate final output.
+
+*   `powershell/modules/ADDiscovery.psm1`
+    *   `Get-ADServers`: Queries Active Directory for server objects.
+        *   Parameters: `-OU`, `-Filter`, `-AllowList`, `-DenyList`.
+        *   Returns a list of computer objects.
+    *   `Write-ADSnapshot`: Saves the raw discovered server list to a file for auditing.
+
+*   `powershell/modules/RemoteExec.psm1`
+    *   `Test-ServerConnectivity`: A wrapper that combines `Test-Connection` and `Test-WSMan`.
+        *   Parameters: `-ComputerName`, `-TimeoutSec`.
+        *   Returns a boolean and latency metrics.
+    *   `Invoke-Parallel`: A helper function to abstract `ForEach-Object -Parallel` or a PS5.1 runspace pool.
+        *   Parameters: `-InputObject`, `-ThrottleLimit`, `-ScriptBlock`.
+
+*   `powershell/modules/RoleDetection.psm1`
+    *   `Get-ServerRole`: The main function, invoked remotely on each server. It calls sub-functions to detect specific roles.
+    *   `Detect-SQLServer`: Checks for SQL services, registry keys, and WMI objects. Returns role details including instance names.
+    *   `Detect-SAP`: Checks for SAP services and `usr\sap` directory structure. Returns SID and instance details.
+    *   `Detect-IIS`: Checks for the `Web-Server` feature and `W3SVC`/`WAS` services.
+    *   `Detect-DomainController`: Checks for the `AD-Domain-Services` role and `NTDS` service.
+    *   `Detect-FilePrintServices`: Checks for `FS-FileServer` and `Print-Services` features.
+    *   `Get-GenericAppServices`: Finds services set to `Automatic` but not `Running`, filtered by an allow/deny list from config.
+
+*   `powershell/modules/ServiceActions.psm1`
+    *   `Get-ServicePlan`: Takes detected roles and the service mapping config to create a definitive list of services to start.
+        *   Handles dependency ordering (e.g., `WAS` before `W3SVC`).
+    *   `Start-ServicePlan`: Executes the service plan on a remote server.
+        *   Parameters: `-ComputerName`, `-ServicePlan`, `-WhatIf`.
+        *   Checks for cluster ownership using `Get-ClusterResource` before starting services.
+        *   Uses a `while` loop with a timeout to verify each service reaches the `Running` state.
+        *   Captures detailed errors for services that fail to start.
+
+*   `powershell/modules/Reporting.psm1`
+    *   `Write-RunReport`: The primary function to generate all report formats.
+        *   Parameters: `-Results`, `-Path`.
+        *   Creates timestamped files (e.g., `RunReport-20250912-143000.csv`).
+    *   `ConvertTo-HtmlReport`: A helper using `PSWriteHTML` to create a user-friendly HTML dashboard.
+        *   **Example Layout:** A summary table at the top (Total Servers, Reachable, Failures), followed by sections for "Connectivity Failures" and "Service Start Failures". The main body is a searchable, sortable table with columns: `ComputerName`, `RolesDetected`, `Service`, `Action`, `Status`, `Duration`, `Error`.
+
+---
+
+### 3. Execution Flow Diagram (Text)
+
+```
+[ Start ]
+    |
+    V
+[ Parse CLI Parameters & Load Config ] -> (settings.json, service-mappings.json)
+    |
+    V
+[ 1. AD Discovery ]
+|-> Get-ADServers (Filter by OU, tags) -> [ Server List Snapshot (audit.json) ]
+    |
+    V
+[ 2. Parallel Processing (ForEach-Object -Parallel) ]
+|
+`-----> [ For each Server in List ] -----------------------------------------...
+          |
+          V
+        [ 2a. Connectivity Check ]
+        |-> Test-ServerConnectivity (Ping, WinRM)
+        |   |
+        |   `-> (Failure?) -> [ Record Failure, Skip to Next Server ]
+        |
+        V
+        [ 2b. Remote Execution (Invoke-Command) ]
+        |   |
+        |   V
+        | [ 3. Role Detection ]
+        | |-> Get-ServerRole
+        |     |-> Detect-SQLServer
+        |     |-> Detect-SAP
+        |     |-> Detect-IIS, etc.
+        |     `-> [ Detected Roles ]
+        |
+        |   V
+        | [ 4. Service Plan ]
+        | |-> Get-ServicePlan (based on roles and config)
+        |     `-> [ Service List with Dependencies ]
+        |
+        |   V
+        | [ 5. Service Action ]
+        | |-> Start-ServicePlan (-WhatIf?)
+        |     |-> Check Cluster Status
+        |     |-> Start Services in Order
+        |     |-> Verify Status
+        |     `-> [ Action Results (Success/Failure + Error) ]
+        |
+        `-----> [ Aggregate Result Object for Server ] ------------------------...
+          |
+          V
+[ 6. Reporting ]
+|-> Write-RunReport (from aggregated results)
+    |-> Report.csv
+    |-> Report.json (for stateful reruns)
+    `-> Report.html
+    |
+    V
+[ 7. Set Exit Code (0, 1, or 2) ]
+    |
+    V
+[ End ]
+```
+
+---
+
+### 4. Risk Register & Mitigations
+
+| Risk ID | Risk Description                                                              | Likelihood | Impact | Mitigation Strategy
