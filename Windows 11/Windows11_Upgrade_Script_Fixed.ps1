@@ -25,6 +25,7 @@ $LogPath = "$env:TEMP\Win11Upgrade.log"
 $ScheduledTaskName = "Win11CompatibilityAlert"
 $HardwareReadinessUrl = "https://aka.ms/HWReadinessScript"
 $Win11AssistantUrl = "https://go.microsoft.com/fwlink/?linkid=2171764"
+$Win11MediaCreationUrl = "https://go.microsoft.com/fwlink/?linkid=2156295"
 
 # Initialize logging
 function Write-Log {

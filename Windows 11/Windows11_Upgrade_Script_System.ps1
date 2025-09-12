@@ -27,6 +27,7 @@ $LogPath = "$env:ProgramData\Win11Upgrade_System.log"
 $ScheduledTaskName = "Win11CompatibilityAlert_System"
 $HardwareReadinessUrl = "https://aka.ms/HWReadinessScript"
 $Win11AssistantUrl = "https://go.microsoft.com/fwlink/?linkid=2171764"
+$Win11MediaCreationUrl = "https://go.microsoft.com/fwlink/?linkid=2156295"
 
 # Initialize logging with system-wide location
 function Write-Log {

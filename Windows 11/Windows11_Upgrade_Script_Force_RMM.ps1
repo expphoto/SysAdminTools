@@ -46,7 +46,7 @@ $ScriptName = "Win11UpgradeScript_Force_RMM"
 $LogPath = "$env:ProgramData\Win11Upgrade_Force_RMM.log"
 $HardwareReadinessUrl = "https://aka.ms/HWReadinessScript"
 $Win11AssistantUrl = "https://go.microsoft.com/fwlink/?linkid=2171764"
-$Win11MediaCreationUrl = "https://go.microsoft.com/fwlink/?LinkId=691209"
+$Win11MediaCreationUrl = "https://go.microsoft.com/fwlink/?linkid=2156295"
 
 # Initialize logging with enhanced RMM support
 function Write-Log {
@@ -213,8 +213,8 @@ function Start-ForceWin11Upgrade {
             # Try Media Creation Tool as fallback
             try {
                 Write-Log "Trying Media Creation Tool as fallback..."
-                Invoke-WebRequest -Uri $Win11MediaCreationUrl -OutFile "$env:TEMP\MediaCreationTool.exe" -UseBasicParsing -TimeoutSec 300
-                $AssistantPath = "$env:TEMP\MediaCreationTool.exe"
+                Invoke-WebRequest -Uri $Win11MediaCreationUrl -OutFile "$env:TEMP\MediaCreationToolW11.exe" -UseBasicParsing -TimeoutSec 300
+                $AssistantPath = "$env:TEMP\MediaCreationToolW11.exe"
                 Write-Log "? Media Creation Tool downloaded successfully" "SUCCESS"
                 $DownloadSuccess = $true
             } catch {

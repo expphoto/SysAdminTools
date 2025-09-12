@@ -36,7 +36,7 @@ $ScriptName = "Win11UpgradeScript_Force"
 $LogPath = "$env:TEMP\Win11Upgrade_Force.log"
 $HardwareReadinessUrl = "https://aka.ms/HWReadinessScript"
 $Win11AssistantUrl = "https://go.microsoft.com/fwlink/?linkid=2171764"
-$Win11MediaCreationUrl = "https://go.microsoft.com/fwlink/?LinkId=691209"
+$Win11MediaCreationUrl = "https://go.microsoft.com/fwlink/?linkid=2156295"
 
 # Initialize logging
 function Write-Log {
@@ -159,8 +159,8 @@ function Start-ForceWin11Upgrade {
         } catch {
             Write-Log "Failed to download Installation Assistant, trying Media Creation Tool" "WARN"
             try {
-                Invoke-WebRequest -Uri $Win11MediaCreationUrl -OutFile "$env:TEMP\MediaCreationTool.exe" -UseBasicParsing
-                $AssistantPath = "$env:TEMP\MediaCreationTool.exe"
+                Invoke-WebRequest -Uri $Win11MediaCreationUrl -OutFile "$env:TEMP\MediaCreationToolW11.exe" -UseBasicParsing
+                $AssistantPath = "$env:TEMP\MediaCreationToolW11.exe"
                 Write-Log "Media Creation Tool downloaded as fallback"
             } catch {
                 throw "Failed to download any Windows 11 upgrade tools"
