@@ -10,6 +10,17 @@ param(
     # how long to wait for a server to come back from reboot before moving on
     [int]$RebootWaitMinutes = 10,
     [switch]$AutoFixWinRM = $true,
+    [switch]$ForceSystemInstall = $false,
+    [switch]$CleanupTasks = $true,
+    [switch]$MonitorSystemInstall = $true,
+    [int]$SystemInstallTimeoutMinutes = 60,
+    # Optional non-interactive inputs
+    [string[]]$Servers,
+    [string]$Username,
+    [string]$Password,
+    [string]$Domain,
+    [switch]$UseLocalAccount,
+    [switch]$RepairWindowsUpdate,
     [switch]$TestMode,
     [switch]$QuickTest
 )
@@ -135,7 +146,15 @@ function Repair-WinRMRemote {
     )
     Write-Log "Attempting WinRM remediation on $Server (via WMI/DCOM)" "WARN"
     $command = @'
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Enable-PSRemoting -Force -SkipNetworkProfileCheck; winrm quickconfig -quiet; netsh advfirewall firewall set rule group='Windows Remote Management' new enable=yes; Write-Host 'OK' } catch { Write-Host ('ERR:' + ($_.Exception.Message)) }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { 
+  Enable-PSRemoting -Force -SkipNetworkProfileCheck;
+  winrm quickconfig -quiet;
+  netsh advfirewall firewall set rule group='Windows Remote Management' new enable=yes | Out-Null;
+  Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'LocalAccountTokenFilterPolicy' -Value 1 -Type DWord -Force;
+  Start-Service -Name bits -ErrorAction SilentlyContinue;
+  Start-Service -Name wuauserv -ErrorAction SilentlyContinue;
+  Write-Host 'OK' 
+} catch { Write-Host ('ERR:' + ($_.Exception.Message)) }"
 '@
     try {
         $res = Invoke-WmiMethod -Class Win32_Process -Name Create -ComputerName $Server -Credential $Credential -ArgumentList $command -ErrorAction Stop
@@ -385,7 +404,7 @@ $SystemAnalysisScript = {
 }
 
 # Disk cleanup script
-    $DiskCleanupScript = {
+$DiskCleanupScript = {
     $result = @{
         Success = $false
         Actions = @()
@@ -472,6 +491,7 @@ $InstallWindowsUpdatesScript = {
         Messages        = @()
         Success         = $false
         PerUpdate       = @()
+        Diagnostics     = @()
     }
     try {
         # Hint the modern Windows Update Orchestrator (USO) so that Settings UI reflects activity.
@@ -483,10 +503,20 @@ $InstallWindowsUpdatesScript = {
             $result.Messages += 'USO triggered: StartScan/StartDownload/StartInstall'
         } catch {}
 
+        # Basic service diagnostics
+        try {
+            $wu = Get-Service -Name wuauserv -ErrorAction Stop
+            $bits = Get-Service -Name BITS -ErrorAction Stop
+            $result.Diagnostics += "WU Service: $($wu.Status) | BITS: $($bits.Status)"
+        } catch {
+            $result.Diagnostics += "Service diagnostics failed: $($_.Exception.Message)"
+        }
+
         $session   = New-Object -ComObject 'Microsoft.Update.Session'
         $searcher  = $session.CreateUpdateSearcher()
-        $criteria  = "IsInstalled=0 and Type='Software' and IsHidden=0"
+        $criteria  = "IsInstalled=0 and IsHidden=0"  # broader criteria; include drivers if applicable
         $search    = $searcher.Search($criteria)
+        try { $result.Diagnostics += "ServerSelection: $($searcher.ServerSelection) | Online: $($searcher.Online)" } catch {}
 
         $result.SearchedCount = $search.Updates.Count
         if ($search.Updates.Count -eq 0) {
@@ -500,19 +530,28 @@ $InstallWindowsUpdatesScript = {
             $upd = $search.Updates.Item($i)
             try { if (-not $upd.EulaAccepted) { $upd.AcceptEula() } } catch {}
             [void]$toInstall.Add($upd)
+            try {
+                $kb = if ($upd.KBArticleIDs) { ($upd.KBArticleIDs -join ',') } else { '' }
+                $cats = @(); foreach($c in $upd.Categories){ $cats += $c.Name }
+                $result.PerUpdate += "Queued: '" + $upd.Title + "' KB:" + $kb + " | Downloaded:" + $upd.IsDownloaded + " | Categories:" + ($cats -join ';')
+            } catch {}
         }
 
         $downloader = $session.CreateUpdateDownloader()
         $downloader.Updates = $toInstall
+        try { $downloader.Priority = 3 } catch {}
         $dlRes = $downloader.Download()
+        try { $result.Diagnostics += "Download ResultCode: $($dlRes.ResultCode) | HResult: " + ('0x{0:X8}' -f [uint32]$dlRes.HResult) } catch {}
         $result.DownloadedCount = ($toInstall | Where-Object { $_.IsDownloaded }).Count
 
         $installer = $session.CreateUpdateInstaller()
         $installer.Updates = $toInstall
+        try { $installer.ForceQuiet = $true } catch {}
+        try { $installer.AllowSourcePrompts = $false } catch {}
         $instRes = $installer.Install()
         $result.InstalledCount = $instRes.UpdatesInstalled
         $result.RebootRequired = [bool]$instRes.RebootRequired
-        $result.Messages += "ResultCode: $($instRes.ResultCode)"
+        $result.Messages += "Install ResultCode: $($instRes.ResultCode) | HResult: " + ('0x{0:X8}' -f [uint32]$instRes.HResult)
         # Interpret installer result: 2=Succeeded, 3=SucceededWithErrors, 4=Failed, 5=Aborted
         if ($instRes.ResultCode -eq 2) {
             $result.Success = $true
@@ -528,7 +567,7 @@ $InstallWindowsUpdatesScript = {
             try {
                 $upd = $toInstall.Item($i)
                 $uRes = $instRes.GetUpdateResult($i)
-                $result.PerUpdate += "Update: '" + $upd.Title + "' -> ResultCode: " + $uRes.ResultCode + ", HResult: " + ('0x{0:X8}' -f [uint32]$uRes.HResult)
+                $result.PerUpdate += "Result: '" + $upd.Title + "' -> ResultCode: " + $uRes.ResultCode + ", HResult: " + ('0x{0:X8}' -f [uint32]$uRes.HResult) + ", IsDownloaded:" + $upd.IsDownloaded
             } catch {}
         }
 
@@ -553,13 +592,39 @@ $InstallWindowsUpdatesScript = {
     return $result
 }
 
+# Optional Windows Update component repair (runs on remote)
+$RepairWUScript = {
+    $out = @()
+    try {
+        $out += 'Stopping services: wuauserv, bits, cryptsvc'
+        Stop-Service -Name wuauserv,bits,cryptsvc -ErrorAction SilentlyContinue -Force
+        Start-Sleep -Seconds 3
+        $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $sd = Join-Path $env:WINDIR 'SoftwareDistribution'
+        $cr = Join-Path $env:WINDIR 'System32\catroot2'
+        if (Test-Path $sd) { Rename-Item -Path $sd -NewName ("SoftwareDistribution.bak_" + $ts) -Force; $out += 'Renamed SoftwareDistribution' }
+        if (Test-Path $cr) { Rename-Item -Path $cr -NewName ("catroot2.bak_" + $ts) -Force; $out += 'Renamed catroot2' }
+        $out += 'Starting services: cryptsvc, bits, wuauserv'
+        Start-Service -Name cryptsvc,bits,wuauserv -ErrorAction SilentlyContinue
+        $out += 'RepairWU: Completed basic reset'
+    } catch {
+        $out += ('RepairWU error: ' + $_.Exception.Message)
+    }
+    return $out
+}
+
 # Main script execution
 Show-Banner
 
 try {
     # Phase 1: Get server list
     Write-Log "Starting Working Interactive Patching Automation" "SUCCESS"
-    $servers = Get-ServersFromInput
+    if ($null -ne $Servers -and $Servers.Count -gt 0) {
+        $servers = $Servers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() }
+        Write-Host "Using servers from parameters: $($servers -join ', ')" -ForegroundColor Cyan
+    } else {
+        $servers = Get-ServersFromInput
+    }
     
     if ($servers.Count -eq 0) {
         Write-Log "No servers to process - exiting" "ERROR"
@@ -569,18 +634,41 @@ try {
     
     # Phase 2: Get credentials
     Write-Host ""
-    $credential = Get-DomainCredentials
-    if (-not $credential) {
-        Write-Log "Failed to obtain credentials - exiting" "ERROR"
-        Read-Host "Press Enter to exit"
-        exit 1
+    $credential = $null
+    $credentialMap = @{}
+    if ($Username -and $Password) {
+        if ($UseLocalAccount) {
+            # Create per-server local credentials: <server>\<username>
+            $sec = ConvertTo-SecureString -String $Password -AsPlainText -Force
+            foreach ($s in $servers) {
+                $u = "$s\$Username"
+                $credentialMap[$s] = New-Object System.Management.Automation.PSCredential($u, $sec)
+            }
+            Write-Log "Using per-server local Administrator credentials (UseLocalAccount)" "INFO"
+        } else {
+            $fullUser = if ($Domain) { "$Domain\$Username" } else { $Username }
+            $sec = ConvertTo-SecureString -String $Password -AsPlainText -Force
+            $credential = New-Object System.Management.Automation.PSCredential($fullUser, $sec)
+            Write-Log "Using provided credentials for all servers: $fullUser" "INFO"
+        }
+    } else {
+        $credential = Get-DomainCredentials
+        if (-not $credential) {
+            Write-Log "Failed to obtain credentials - exiting" "ERROR"
+            Read-Host "Press Enter to exit"
+            exit 1
+        }
     }
     
     # Phase 3: Configuration summary
     Write-Host ""
     Write-Host "PROCESSING CONFIGURATION:" -ForegroundColor Cyan
     Write-Host "  Servers to process: $($servers.Count)" -ForegroundColor White
-    Write-Host "  Authentication: $($credential.UserName)" -ForegroundColor White
+    if ($credential) {
+        Write-Host "  Authentication: $($credential.UserName)" -ForegroundColor White
+    } else {
+        Write-Host "  Authentication: per-server local account ($Username)" -ForegroundColor White
+    }
     Write-Host "  Max cycles: $MaxCycles" -ForegroundColor White
     Write-Host "  Retry interval: $RetryIntervalMinutes minutes" -ForegroundColor White
     if ($TestMode) {
@@ -621,9 +709,10 @@ try {
         Write-Log "Testing $server..." "INFO"
         
         try {
+            $credToUse = if ($credentialMap.ContainsKey($server)) { $credentialMap[$server] } else { $credential }
             $sessionParams = @{
                 ComputerName = $server
-                Credential = $credential
+                Credential = $credToUse
                 ErrorAction = 'Stop'
             }
             
@@ -654,10 +743,12 @@ try {
             $err = $_.Exception.Message
             Write-Log "FAILED: $server - $err" "ERROR"
             if ($AutoFixWinRM -and $err -match 'WinRM|Access is denied|cannot connect|The client cannot connect') {
-                if (Repair-WinRMRemote -Server $server -Credential $credential) {
+                $credFix = if ($credentialMap.ContainsKey($server)) { $credentialMap[$server] } else { $credential }
+                if (Repair-WinRMRemote -Server $server -Credential $credFix) {
                     Write-Log "Retrying WinRM connection after remediation..." "INFO"
                     Start-Sleep -Seconds 10
                     try {
+                        $sessionParams.Credential = $credFix
                         $session = New-PSSession @sessionParams
                         $remoteInfo = Invoke-Command -Session $session -ScriptBlock {
                             @{
@@ -737,9 +828,10 @@ try {
             
             try {
                 # Create session
+                $credToUse = if ($credentialMap.ContainsKey($server)) { $credentialMap[$server] } else { $credential }
                 $sessionParams = @{
                     ComputerName = $server
-                    Credential = $credential
+                    Credential = $credToUse
                     ErrorAction = 'Stop'
                 }
                 $session = New-PSSession @sessionParams
@@ -791,17 +883,143 @@ try {
                             $remediation.ActionsPerformed += $testMessage
                             Write-Log "     TEST MODE: Update installation simulated" "SUCCESS"
                         } else {
-                            $installResult = Invoke-Command -Session $session -ScriptBlock $InstallWindowsUpdatesScript
+                            $installResult = $null
+                            if (-not $ForceSystemInstall) {
+                                $installResult = Invoke-Command -Session $session -ScriptBlock $InstallWindowsUpdatesScript
+                            }
                             $remediation.ActionsPerformed += "Updates searched: $($installResult.SearchedCount), downloaded: $($installResult.DownloadedCount), installed: $($installResult.InstalledCount)"
-                            if ($installResult.Messages.Count -gt 0) { $remediation.ActionsPerformed += $installResult.Messages }
+                            if ($installResult.Diagnostics) { foreach($d in $installResult.Diagnostics){ Write-Log ("     DIAG: " + $d) "INFO" } }
+                            if ($installResult.Messages) { foreach($m in $installResult.Messages){ Write-Log ("     MSG: " + $m) "INFO" } }
                             # Log installer result detail if present
                             if ($installResult.PSObject.Properties.Match('PerUpdate').Count -gt 0 -and $installResult.PerUpdate) {
-                                foreach ($u in $installResult.PerUpdate) { $remediation.ActionsPerformed += $u }
+                                foreach ($u in $installResult.PerUpdate) { Write-Log ("     " + $u) "INFO"; $remediation.ActionsPerformed += $u }
                             }
-                            if ($installResult.Success) {
+                            if ($installResult -and $installResult.Success) {
                                 Write-Log "     Windows Updates installation completed (Installed: $($installResult.InstalledCount))" "SUCCESS"
                             } else {
                                 Write-Log "     Windows Updates installation had issues" "WARN"
+                                if ($RepairWindowsUpdate) {
+                                    Write-Log "     Attempting Windows Update component repair..." "WARN"
+                                    $repairOut = Invoke-Command -Session $session -ScriptBlock $RepairWUScript
+                                    foreach($line in $repairOut){ Write-Log ("       " + $line) "INFO" }
+                                    Write-Log "     Re-scanning and retrying install after repair..." "WARN"
+                                    if (-not $ForceSystemInstall) {
+                                        $installResult = Invoke-Command -Session $session -ScriptBlock $InstallWindowsUpdatesScript
+                                    }
+                                    if ($installResult.Messages) { foreach($m in $installResult.Messages){ Write-Log ("       MSG: " + $m) "INFO" } }
+                                    if ($installResult.PerUpdate) { foreach($u in $installResult.PerUpdate){ Write-Log ("       " + $u) "INFO" } }
+                                    if ($installResult -and $installResult.Success) {
+                                        Write-Log "     Retry install completed (Installed: $($installResult.InstalledCount))" "SUCCESS"
+                                    } else {
+                                        Write-Log "     Retry install still had issues" "ERROR"
+                                    }
+                                }
+
+                                if (-not $installResult.Success) {
+                                    Write-Log "     Falling back to SYSTEM scheduled task for update install..." "WARN"
+                                    try {
+                                    $credToUse3 = if ($credentialMap.ContainsKey($server)) { $credentialMap[$server] } else { $credential }
+                                    $sysResult = Invoke-Command -ComputerName $server -Credential $credToUse3 -ScriptBlock {
+                                        $root = Join-Path $env:ProgramData 'InteractivePatching'
+                                        New-Item -ItemType Directory -Path $root -Force | Out-Null
+                                        $scriptPath = Join-Path $root 'Run-WUInstall.ps1'
+                                        $outPath = Join-Path $root 'WU-Result.json'
+                                        $hbPath = Join-Path $root 'WU-Heartbeat.txt'
+                                        $script = @'
+param($OutPath)
+try {
+  $result = @{ Messages=@(); Diagnostics=@(); PerUpdate=@(); SearchedCount=0; DownloadedCount=0; InstalledCount=0; RebootRequired=$false; Success=$false }
+  $result.Messages += 'SYSTEM task starting'
+  $hbPath = Join-Path $env:ProgramData 'InteractivePatching\WU-Heartbeat.txt'
+  function Write-HB($m){ try { Add-Content -LiteralPath $hbPath -Value ("[{0}] {1}" -f (Get-Date), $m) -Encoding UTF8 } catch {} ; try { $src='InteractivePatchingAutomation'; if(-not [System.Diagnostics.EventLog]::SourceExists($src)){ New-EventLog -LogName Application -Source $src -ErrorAction SilentlyContinue | Out-Null }; Write-EventLog -LogName Application -Source $src -EntryType Information -EventId 10011 -Message $m -ErrorAction SilentlyContinue } catch {} }
+  Write-HB 'SYSTEM task initialized'
+  try {
+    foreach($cmd in @('RefreshSettings','StartInteractiveScan','StartDownload','StartInstall')){ Start-Process -FilePath 'usoclient.exe' -ArgumentList $cmd -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null; Start-Sleep -Seconds 2 }
+    $result.Messages += 'USO sequence triggered'
+    Write-HB 'USO sequence triggered'
+  } catch {}
+  $session   = New-Object -ComObject "Microsoft.Update.Session"
+  $searcher  = $session.CreateUpdateSearcher()
+  Write-HB 'Scan started'
+  $search    = $searcher.Search("IsInstalled=0 and IsHidden=0")
+  $result.SearchedCount = $search.Updates.Count
+  Write-HB ("Scan complete. Found {0} updates" -f $result.SearchedCount)
+  if ($search.Updates.Count -gt 0) {
+    $coll = New-Object -ComObject "Microsoft.Update.UpdateColl"
+    for($i=0;$i -lt $search.Updates.Count;$i++){ $u=$search.Updates.Item($i); try{ if(-not $u.EulaAccepted){ $u.AcceptEula() } }catch{}; [void]$coll.Add($u) }
+    $down = $session.CreateUpdateDownloader(); $down.Updates = $coll; Write-HB 'Download started'; $dres = $down.Download();
+    $result.Diagnostics += ("Download RC: {0} HR: 0x{1:X8}" -f $dres.ResultCode, [uint32]$dres.HResult)
+    $result.DownloadedCount = ($coll | ? { $_.IsDownloaded }).Count
+    Write-HB ("Download finished. Downloaded {0} updates" -f $result.DownloadedCount)
+    $inst = $session.CreateUpdateInstaller(); $inst.Updates = $coll; try { $inst.ForceQuiet=$true } catch {} ; try { $inst.AllowSourcePrompts=$false } catch {}
+    Write-HB 'Install started'
+    $ires = $inst.Install();
+    $result.InstalledCount = $ires.UpdatesInstalled
+    $result.RebootRequired = [bool]$ires.RebootRequired
+    $result.Messages += ("Install RC: {0} HR: 0x{1:X8}" -f $ires.ResultCode, [uint32]$ires.HResult)
+    $result.Success = ($ires.ResultCode -eq 2 -or $ires.ResultCode -eq 3)
+    for($i=0;$i -lt $coll.Count;$i++){ try{ $u=$coll.Item($i); $ur=$ires.GetUpdateResult($i); $result.PerUpdate += ("Result: '"+$u.Title+"' RC:"+$ur.ResultCode+" HR: 0x"+([uint32]$ur.HResult).ToString('X8')) }catch{} }
+    Write-HB ("Install finished. Installed {0} updates. RebootRequired={1}" -f $result.InstalledCount, $result.RebootRequired)
+  } else { $result.Success=$true; $result.Messages += 'No updates available' }
+} catch { $result.Messages += ('SYSTEM task error: ' + $_.Exception.Message) }
+try { $result | ConvertTo-Json -Depth 5 | Out-File -FilePath $OutPath -Encoding UTF8 -Force } catch {}
+'@
+                                        Set-Content -LiteralPath $scriptPath -Value $script -Encoding UTF8 -Force
+                                        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -OutPath `"$outPath`""
+                                        $taskName = 'InteractivePatching_WUInstall'
+                                        try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                                        $task = Register-ScheduledTask -TaskName $taskName -Action $action -RunLevel Highest -User 'SYSTEM' -Force
+                                        Start-ScheduledTask -TaskName $taskName
+                                        $deadline = (Get-Date).AddMinutes($using:SystemInstallTimeoutMinutes)
+                                        do { Start-Sleep -Seconds 10 } while ((-not (Test-Path $outPath)) -and (Get-Date) -lt $deadline)
+                                        $payload = if (Test-Path $outPath) { Get-Content -LiteralPath $outPath -Raw } else { '{"Messages":["Timeout waiting for SYSTEM task"],"Success":false}' }
+                                        # Cleanup scheduled task and temp files
+                                        try { if ($using:CleanupTasks) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } } catch {}
+                                        try { if ($using:CleanupTasks) { Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue } } catch {}
+                                        try { if ($using:CleanupTasks) { Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue } } catch {}
+                                        try { if ($using:CleanupTasks) { Remove-Item -LiteralPath $hbPath -Force -ErrorAction SilentlyContinue } } catch {}
+                                        $payload
+                                    }
+                                    } catch {
+                                        $sysResult = $null
+                                    }
+                                    if (-not $sysResult) {
+                                        # Session may have disconnected; wait and try a new session to read the output
+                                        Write-Log "     Session dropped during SYSTEM task. Waiting for host and retrying fetch..." "WARN"
+                                        if (Wait-ForServerOnline -Server $server -Credential $credToUse3 -TimeoutSeconds 900 -PollSeconds 15) {
+                                            try {
+                                                $sysResult = Invoke-Command -ComputerName $server -Credential $credToUse3 -ScriptBlock {
+                                                    $outPath = Join-Path (Join-Path $env:ProgramData 'InteractivePatching') 'WU-Result.json'
+                                                    if (Test-Path $outPath) { Get-Content -LiteralPath $outPath -Raw } else { '' }
+                                                }
+                                            } catch {
+                                                Write-Log "     Failed to reconnect and fetch SYSTEM task output." "ERROR"
+                                            }
+                                        } else {
+                                            Write-Log "     Host did not come back online in time to fetch SYSTEM output." "ERROR"
+                                        }
+                                    }
+                                    if ($sysResult) {
+                                        try { $sysObj = $sysResult | ConvertFrom-Json } catch { $sysObj = $null }
+                                        if ($sysObj) {
+                                            if ($sysObj.Diagnostics) { foreach($d in $sysObj.Diagnostics){ Write-Log ("       SYS DIAG: " + $d) "INFO" } }
+                                            if ($sysObj.Messages) { foreach($m in $sysObj.Messages){ Write-Log ("       SYS MSG: " + $m) "INFO" } }
+                                            if ($sysObj.PerUpdate) { foreach($u in $sysObj.PerUpdate){ Write-Log ("       SYS " + $u) "INFO" } }
+                                            if ($sysObj.Success) {
+                                                Write-Log "     SYSTEM fallback succeeded." "SUCCESS"
+                                                $installResult.Success = $true
+                                                $installResult.InstalledCount = $sysObj.InstalledCount
+                                                if ($sysObj.RebootRequired -and -not $analysis.PendingReboot) { $analysis.PendingReboot = $true }
+                                            } else {
+                                                Write-Log "     SYSTEM fallback did not complete successfully." "ERROR"
+                                            }
+                                        } else {
+                                            Write-Log "     SYSTEM fallback returned non-JSON output." "ERROR"
+                                        }
+                                    } else {
+                                        Write-Log "     SYSTEM fallback produced no output." "ERROR"
+                                    }
+                            }
                             }
                             if ($installResult.RebootRequired -and -not $analysis.PendingReboot) {
                                 # Mark for reboot in this cycle
@@ -827,9 +1045,10 @@ try {
                             Write-Log "     TEST MODE: Reboot simulated" "SUCCESS"
                         } else {
                             try {
+                                $credToUse2 = if ($credentialMap.ContainsKey($server)) { $credentialMap[$server] } else { $credential }
                                 $rebootParams = @{
                                     ComputerName = $server
-                                    Credential = $credential
+                                    Credential = $credToUse2
                                     Force = $true
                                     ErrorAction = 'Stop'
                                 }
@@ -840,7 +1059,7 @@ try {
                                 # Poll for the server to return to speed up next cycle
                                 $waitSecs = [Math]::Max(120, $RebootWaitMinutes * 60)
                                 Write-Log "     Waiting up to $([int]($waitSecs/60)) minutes for $server to come back online..." "INFO"
-                                if (Wait-ForServerOnline -Server $server -Credential $credential -TimeoutSeconds $waitSecs -PollSeconds 15) {
+                                if (Wait-ForServerOnline -Server $server -Credential $credToUse2 -TimeoutSeconds $waitSecs -PollSeconds 15) {
                                     Write-Log "     $server is back online." "SUCCESS"
                                     $returnedEarlyThisCycle = $true
                                 } else {

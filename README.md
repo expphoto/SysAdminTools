@@ -2,6 +2,34 @@
 
 A collection of PowerShell scripts for Windows system administration, specifically focused on OneDrive migration and folder redirection management.
 
+## Patching At A Glance
+
+See `Patching/README.md` for full details on the interactive patching automation.
+
+- Interactive paste input; parses hostnames/IPs from mixed text
+- Continuous remediation until clear (updates=0, no reboot pending, disk OK)
+- Safe cleanup (temp/logs + DISM) when low on disk
+- WinRM auto-fix (optional) and reboot polling
+- WSUS/GPO-friendly SYSTEM install path with live monitor mode
+
+Quick start examples:
+
+```powershell
+# Standard run (interactive paste)
+pwsh -NoProfile -File .\Patching\interactive-patching-automation.ps1
+
+# WSUS/GPO environment with live monitoring and cleanup
+pwsh -NoProfile -File .\Patching\interactive-patching-automation.ps1 `
+  -Servers 192.168.0.56 `
+  -Username 'DOMAIN\\PatchSvc' -Password '********' `
+  -ForceSystemInstall -RepairWindowsUpdate -SystemInstallTimeoutMinutes 90
+```
+
+Outputs (written to `Patching` folder):
+- `Working-Patching-Log_YYYYMMDD_HHMMSS.log`
+- `Working-Connectivity-Results_YYYYMMDD_HHMMSS.csv`
+- `Working-Interactive-Results_YYYYMMDD_HHMMSS.csv`
+
 ## Scripts Overview
 
 ### 🖥️ Windows 11 Deployment

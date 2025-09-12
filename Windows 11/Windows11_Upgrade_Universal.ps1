@@ -6,7 +6,8 @@
 #   Force mode:  .\Windows11_Upgrade_Universal.ps1 -Force
 
 param(
-    [switch]$Force = $false  # Add -Force parameter to bypass compatibility checks
+    [switch]$Force = $false,   # Add -Force parameter to bypass compatibility checks
+    [switch]$Silent = $true    # Suppress user-facing popups/UI
 )
 
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned -Force
@@ -27,6 +28,7 @@ function Write-Log {
 
 function Show-UserNotification {
     param([string]$Title, [string]$Message, [string]$Icon = 'Information')
+    if ($Silent) { return }
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
         [System.Windows.Forms.MessageBox]::Show($Message, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::$Icon) | Out-Null
@@ -303,7 +305,7 @@ function Start-Win11Upgrade {
         Write-Log "Process arguments: $($ProcessArgs -join ' ')"
         
         try {
-            $Process = Start-Process -FilePath $AssistantPath -ArgumentList $ProcessArgs -PassThru
+            $Process = Start-Process -FilePath $AssistantPath -ArgumentList $ProcessArgs -WindowStyle Hidden -PassThru
             Start-Sleep -Seconds 3
             
             if ($Process -and !$Process.HasExited) {
@@ -368,7 +370,7 @@ Add-Type -AssemblyName System.Windows.Forms
             Write-Log "Warning: Could not create scheduled task: $($_.Exception.Message)" "WARN"
         }
         
-        if ($IsInitialRun) {
+        if ($IsInitialRun -and -not $Silent) {
             Show-UserNotification -Title "Windows 11 Compatibility" -Message "Your computer does not meet Windows 11 requirements. You will receive monthly reminders. Consider hardware upgrades or contact IT support." -Icon "Warning"
         }
     }
@@ -389,6 +391,7 @@ function Main {
     Write-Log "=== Windows 11 Universal Upgrade Script Started ==="
     Write-Log "Script version: 3.0 (Universal - RMM & ScreenConnect compatible)"
     Write-Log "Mode: $ModeText"
+    Write-Log "Silent mode: $Silent"
     Write-Log "Current user: $env:USERNAME"
     Write-Log "Computer name: $env:COMPUTERNAME"
     Write-Log "Command line args: $($PSBoundParameters | ConvertTo-Json -Compress)"
