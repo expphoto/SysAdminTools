@@ -8,10 +8,16 @@
     or sets up recurring alerts for incompatible systems.
 
 .NOTES
-    Version: 1.1
+    Version: 1.2
     Author: MSP Admin
     Date: September 2025
     Requires: PowerShell 5.1+, Windows 10
+    
+    Version 1.2 Changes:
+    - Enhanced compatibility logging with specific failure reasons
+    - Added storage space and UEFI firmware checks
+    - Improved Microsoft Hardware Readiness output parsing
+    - Added override recommendations for business decisions
 #>
 
 # Set execution policy for this session - enhanced for automated execution
@@ -68,36 +74,96 @@ function Show-UserNotification {
 function Test-BasicWin11Requirements {
     Write-Log "Performing basic Windows 11 compatibility check"
     
+    $CompatibilityIssues = @()
+    $IsCompatible = $true
+    
     try {
         # Check TPM 2.0
         $TPM = Get-WmiObject -Namespace "Root\CIMv2\Security\MicrosoftTpm" -Class Win32_Tpm -ErrorAction SilentlyContinue
         $HasTPM = $TPM -and $TPM.SpecVersion -like "2.*"
-        Write-Log "TPM 2.0 available: $HasTPM"
+        
+        if ($HasTPM) {
+            Write-Log "✓ TPM 2.0 available: YES (Version: $($TPM.SpecVersion))"
+        } else {
+            Write-Log "✗ TPM 2.0 available: NO"
+            $CompatibilityIssues += "TPM 2.0 not found or not version 2.0"
+            $IsCompatible = $false
+        }
         
         # Check Secure Boot
         $SecureBoot = $false
         try {
             $SecureBoot = (Confirm-SecureBootUEFI -ErrorAction SilentlyContinue) -eq $true
         } catch {
-            Write-Log "Unable to check Secure Boot status"
+            Write-Log "Unable to check Secure Boot status (may indicate BIOS/Legacy mode)"
+            $CompatibilityIssues += "Unable to verify Secure Boot (system may be in BIOS/Legacy mode)"
         }
-        Write-Log "Secure Boot enabled: $SecureBoot"
+        
+        if ($SecureBoot) {
+            Write-Log "✓ Secure Boot enabled: YES"
+        } else {
+            Write-Log "✗ Secure Boot enabled: NO"
+            $CompatibilityIssues += "Secure Boot is not enabled"
+            $IsCompatible = $false
+        }
         
         # Check RAM (minimum 4GB)
         $RAM = (Get-WmiObject -Class Win32_ComputerSystem).TotalPhysicalMemory / 1GB
         $HasEnoughRAM = $RAM -ge 4
-        Write-Log "RAM: $([math]::Round($RAM, 1))GB (Required: 4GB+) - $HasEnoughRAM"
         
-        # Check CPU generation (basic check)
+        if ($HasEnoughRAM) {
+            Write-Log "✓ RAM: $([math]::Round($RAM, 1))GB (Required: 4GB+) - SUFFICIENT"
+        } else {
+            Write-Log "✗ RAM: $([math]::Round($RAM, 1))GB (Required: 4GB+) - INSUFFICIENT"
+            $CompatibilityIssues += "Insufficient RAM: $([math]::Round($RAM, 1))GB (minimum 4GB required)"
+            $IsCompatible = $false
+        }
+        
+        # Check CPU generation and architecture
         $CPU = Get-WmiObject -Class Win32_Processor | Select-Object -First 1
-        Write-Log "CPU: $($CPU.Name)"
+        Write-Log "CPU Info: $($CPU.Name) (Architecture: $($CPU.Architecture), Max Clock: $($CPU.MaxClockSpeed)MHz)"
         
-        # Basic compatibility: TPM + RAM check
-        if ($HasTPM -and $HasEnoughRAM) {
-            Write-Log "Basic compatibility check: PASSED"
+        # Check storage space (minimum 64GB free)
+        $SystemDrive = Get-WmiObject -Class Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $env:SystemDrive }
+        $FreeSpaceGB = [math]::Round($SystemDrive.FreeSpace / 1GB, 1)
+        $HasEnoughSpace = $FreeSpaceGB -ge 64
+        
+        if ($HasEnoughSpace) {
+            Write-Log "✓ Storage space: ${FreeSpaceGB}GB free (Required: 64GB+) - SUFFICIENT"
+        } else {
+            Write-Log "✗ Storage space: ${FreeSpaceGB}GB free (Required: 64GB+) - INSUFFICIENT"
+            $CompatibilityIssues += "Insufficient storage space: ${FreeSpaceGB}GB free (minimum 64GB required)"
+            $IsCompatible = $false
+        }
+        
+        # Check UEFI firmware
+        try {
+            $FirmwareType = (Get-WmiObject -Class Win32_ComputerSystem).PCSystemType
+            $IsUEFI = Test-Path "$env:SystemDrive\EFI"
+            if ($IsUEFI) {
+                Write-Log "✓ UEFI firmware: YES"
+            } else {
+                Write-Log "✗ UEFI firmware: NO (Legacy BIOS detected)"
+                $CompatibilityIssues += "Legacy BIOS detected (UEFI firmware required)"
+                $IsCompatible = $false
+            }
+        } catch {
+            Write-Log "Unable to determine firmware type" "WARN"
+            $CompatibilityIssues += "Unable to verify UEFI firmware"
+        }
+        
+        # Log compatibility summary
+        if ($IsCompatible) {
+            Write-Log "=== COMPATIBILITY CHECK: PASSED ==="
+            Write-Log "System meets all basic Windows 11 requirements"
             return 0
         } else {
-            Write-Log "Basic compatibility check: FAILED"
+            Write-Log "=== COMPATIBILITY CHECK: FAILED ==="
+            Write-Log "COMPATIBILITY ISSUES FOUND:"
+            foreach ($Issue in $CompatibilityIssues) {
+                Write-Log "  - $Issue" "ERROR"
+            }
+            Write-Log "OVERRIDE RECOMMENDATION: Review issues above. TPM and Secure Boot can sometimes be enabled in BIOS. RAM and storage upgrades may be cost-effective." "WARN"
             return 1
         }
     }
@@ -128,9 +194,19 @@ function Test-Win11Compatibility {
             $Result = & $TempScript 2>&1
             $ExitCode = $LASTEXITCODE
             
-            # Log the script output for debugging
+            # Enhanced logging of Microsoft script output
             if ($Result) {
-                Write-Log "HardwareReadiness.ps1 output: $($Result -join '; ')"
+                Write-Log "=== MICROSOFT HARDWARE READINESS OUTPUT ==="
+                foreach ($Line in $Result) {
+                    if ($Line -match "FAIL|ERROR|NOT COMPATIBLE|REQUIREMENT") {
+                        Write-Log "  ✗ $Line" "ERROR"
+                    } elseif ($Line -match "PASS|SUCCESS|COMPATIBLE|MEETS") {
+                        Write-Log "  ✓ $Line" "INFO"
+                    } elseif ($Line.ToString().Trim() -ne "") {
+                        Write-Log "  $Line" "INFO"
+                    }
+                }
+                Write-Log "=== END MICROSOFT OUTPUT ==="
             }
             
             # Handle null exit code
@@ -140,7 +216,19 @@ function Test-Win11Compatibility {
                 return Test-BasicWin11Requirements
             }
 
-            Write-Log "Hardware readiness check completed with exit code: $ExitCode"
+            # Provide interpretation of Microsoft script results
+            switch ($ExitCode) {
+                0 { 
+                    Write-Log "Microsoft Hardware Readiness: COMPATIBLE - System meets Windows 11 requirements" 
+                }
+                1 { 
+                    Write-Log "Microsoft Hardware Readiness: NOT COMPATIBLE - System does not meet Windows 11 requirements" "ERROR"
+                    Write-Log "OVERRIDE CONSIDERATION: Check specific failed requirements above. Some issues (TPM, Secure Boot) may be fixable via BIOS settings." "WARN"
+                }
+                default { 
+                    Write-Log "Microsoft Hardware Readiness: UNKNOWN RESULT (Exit code: $ExitCode)" "WARN"
+                }
+            }
             
             # Clean up temp file
             Remove-Item $TempScript -Force -ErrorAction SilentlyContinue
@@ -255,7 +343,7 @@ function Test-Administrator {
 # Main script execution
 function Main {
     Write-Log "=== Windows 11 Upgrade Script Started ==="
-    Write-Log "Script version: 1.1"
+    Write-Log "Script version: 1.2 (Enhanced Compatibility Logging)"
     Write-Log "Current user: $env:USERNAME"
     Write-Log "Computer name: $env:COMPUTERNAME"
     
@@ -282,25 +370,32 @@ function Main {
     switch ($CompatibilityResult) {
         0 {
             # Compatible - proceed with upgrade
-            Write-Log "System is compatible with Windows 11"
+            Write-Log "=== FINAL RESULT: SYSTEM IS COMPATIBLE WITH WINDOWS 11 ==="
+            Write-Log "All Windows 11 requirements are met. Proceeding with upgrade process."
 
             if ($IsAdmin) {
+                Write-Log "Administrative privileges confirmed - starting upgrade process"
                 Start-Win11Upgrade
             }
             else {
-                Write-Log "Administrator rights required for upgrade - cannot proceed in automated mode" "ERROR"
+                Write-Log "UPGRADE BLOCKED: Administrator rights required for upgrade - cannot proceed in automated mode" "ERROR"
+                Write-Log "MANUAL ACTION REQUIRED: Run this script as Administrator or manually download Windows 11 Installation Assistant" "WARN"
                 Show-UserNotification -Title "Windows 11 Upgrade Available" -Message "Your computer is compatible with Windows 11. Administrator rights required for upgrade." -Icon "Information"
                 exit 1
             }
         }
         1 {
             # Not compatible - set up alerts
-            Write-Log "System is not compatible with Windows 11"
+            Write-Log "=== FINAL RESULT: SYSTEM IS NOT COMPATIBLE WITH WINDOWS 11 ==="
+            Write-Log "One or more Windows 11 requirements are not met. Setting up monthly reminder alerts."
+            Write-Log "BUSINESS DECISION REQUIRED: Review compatibility issues above to determine if hardware upgrades are cost-effective vs. continuing with Windows 10 until end of support (Oct 2025)" "WARN"
             New-MonthlyAlertTask -IsInitialRun $true
         }
         default {
             # Error or undetermined
+            Write-Log "=== FINAL RESULT: COMPATIBILITY STATUS UNKNOWN ===" "ERROR"
             Write-Log "Unable to determine Windows 11 compatibility (Exit code: $CompatibilityResult)" "ERROR"
+            Write-Log "TROUBLESHOOTING: Check network connectivity, antivirus interference, or try running script as Administrator" "WARN"
             Show-UserNotification -Title "Compatibility Check Error" -Message "Unable to determine Windows 11 compatibility. Check logs at $LogPath or try running the script again." -Icon "Error"
         }
     }
