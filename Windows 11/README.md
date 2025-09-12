@@ -32,15 +32,26 @@ This folder contains PowerShell scripts for checking Windows 11 compatibility an
 **⚠️ FORCE UPGRADE Version** - Bypasses ALL compatibility checks for testing/VMs.
 
 - **Execution Context**: Local Administrator (REQUIRED)
-- **Use Case**: VMs, testing environments, lab systems
+- **Use Case**: Interactive testing, individual VMs, manual force upgrades
 - **⚠️ WARNING**: This bypasses all hardware requirements and may result in unsupported installations
 - **Features**:
   - **Bypasses ALL Windows 11 compatibility checks**
   - **Registry modifications to disable upgrade blocks**
-  - **Perfect for VMs with limited resources (like 2GB RAM!)**
-  - **Multiple upgrade methods with compatibility overrides**
-  - **Enhanced warnings and user confirmations**
-  - **Ideal for testing Windows 11 on Synology VMs or other limited hardware**
+  - **Interactive confirmations and warnings**
+  - **Perfect for manual testing scenarios**
+
+### 4. Windows11_Upgrade_Script_Force_RMM.ps1
+**🤖 AUTOMATED FORCE UPGRADE** - Fully automated, no user interaction required.
+
+- **Execution Context**: SYSTEM/Administrator via RMM tools
+- **Use Case**: **Mass VM deployments, automated testing, your Synology VM scenario!**
+- **⚠️ WARNING**: Completely automated - no confirmations, just forces the upgrade
+- **Features**:
+  - **Fully non-interactive for RMM deployment**
+  - **Bypasses ALL Windows 11 compatibility checks automatically**
+  - **No MessageBox errors when running via RMM tools**
+  - **Enhanced logging for remote monitoring**
+  - **Perfect for your 2GB RAM VM - just upload and run!**
 
 ## Deployment Guide
 
@@ -50,16 +61,27 @@ This folder contains PowerShell scripts for checking Windows 11 compatibility an
 .\Windows11_Upgrade_Script_Fixed.ps1
 ```
 
-### For FORCE Upgrade (VMs/Testing)
+### For FORCE Upgrade (Interactive Testing)
 ```powershell
-# Must run as Administrator - Perfect for your 2GB RAM Synology VM!
+# Must run as Administrator - Interactive with confirmations
 .\Windows11_Upgrade_Script_Force.ps1
 ```
-**⚠️ This will bypass ALL compatibility checks including:**
+
+### For AUTOMATED FORCE Upgrade (RMM/Mass Deployment)
+```powershell
+# Perfect for your Synology VM via RMM tools - NO user interaction!
+.\Windows11_Upgrade_Script_Force_RMM.ps1
+```
+**🚀 The RMM version is what you want for your VM!** It:
+- Runs completely automatically
+- No dialog box errors in RMM environments
+- Just uploads, runs, and forces Windows 11 upgrade
+
+**⚠️ Both will bypass ALL compatibility checks including:**
 - TPM 2.0 requirement
 - Secure Boot requirement  
 - CPU compatibility
-- RAM requirements (perfect for 2GB systems!)
+- RAM requirements (perfect for 2-4GB systems!)
 - Storage space checks
 - UEFI requirements
 
