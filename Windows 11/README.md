@@ -28,6 +28,20 @@ This folder contains PowerShell scripts for checking Windows 11 compatibility an
   - Automatic detection of logged-in users
   - Centralized logging to `$env:ProgramData`
 
+### 3. Windows11_Upgrade_Script_Force.ps1
+**⚠️ FORCE UPGRADE Version** - Bypasses ALL compatibility checks for testing/VMs.
+
+- **Execution Context**: Local Administrator (REQUIRED)
+- **Use Case**: VMs, testing environments, lab systems
+- **⚠️ WARNING**: This bypasses all hardware requirements and may result in unsupported installations
+- **Features**:
+  - **Bypasses ALL Windows 11 compatibility checks**
+  - **Registry modifications to disable upgrade blocks**
+  - **Perfect for VMs with limited resources (like 2GB RAM!)**
+  - **Multiple upgrade methods with compatibility overrides**
+  - **Enhanced warnings and user confirmations**
+  - **Ideal for testing Windows 11 on Synology VMs or other limited hardware**
+
 ## Deployment Guide
 
 ### For Individual Computers
@@ -35,6 +49,19 @@ This folder contains PowerShell scripts for checking Windows 11 compatibility an
 # Run as Administrator
 .\Windows11_Upgrade_Script_Fixed.ps1
 ```
+
+### For FORCE Upgrade (VMs/Testing)
+```powershell
+# Must run as Administrator - Perfect for your 2GB RAM Synology VM!
+.\Windows11_Upgrade_Script_Force.ps1
+```
+**⚠️ This will bypass ALL compatibility checks including:**
+- TPM 2.0 requirement
+- Secure Boot requirement  
+- CPU compatibility
+- RAM requirements (perfect for 2GB systems!)
+- Storage space checks
+- UEFI requirements
 
 ### For Mass Deployment via ScreenConnect/RMM
 1. Upload `Windows11_Upgrade_Script_System.ps1` to your RMM tool
