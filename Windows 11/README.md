@@ -1,0 +1,115 @@
+# Windows 11 Upgrade Scripts
+
+This folder contains PowerShell scripts for checking Windows 11 compatibility and performing upgrades in different deployment scenarios.
+
+## Scripts Overview
+
+### 1. Windows11_Upgrade_Script_Fixed.ps1
+**Standard Version** - For individual user execution or local administrative use.
+
+- **Execution Context**: Local Administrator or User
+- **Use Case**: Manual execution, individual computers
+- **Features**:
+  - Checks Windows 11 compatibility using Microsoft's official tools
+  - Shows user notifications and prompts
+  - Creates user-specific scheduled tasks
+  - Logs to user temp directory
+
+### 2. Windows11_Upgrade_Script_System.ps1
+**System Version** - For mass deployment via RMM tools like ScreenConnect.
+
+- **Execution Context**: SYSTEM account (via RMM tools)
+- **Use Case**: Mass deployment, automated execution across multiple computers
+- **Features**:
+  - Designed for SYSTEM account execution
+  - Multi-user notification system for all logged-in users
+  - System-wide scheduled task creation
+  - Enhanced logging for enterprise deployment
+  - Automatic detection of logged-in users
+  - Centralized logging to `$env:ProgramData`
+
+## Deployment Guide
+
+### For Individual Computers
+```powershell
+# Run as Administrator
+.\Windows11_Upgrade_Script_Fixed.ps1
+```
+
+### For Mass Deployment via ScreenConnect/RMM
+1. Upload `Windows11_Upgrade_Script_System.ps1` to your RMM tool
+2. Deploy as a script that runs with SYSTEM privileges
+3. The script will:
+   - Automatically detect all logged-in users
+   - Send notifications to each active user session
+   - Create system-wide scheduled tasks for ongoing alerts
+   - Log all activities centrally
+
+#### ScreenConnect Command Example:
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File "C:\Path\To\Windows11_Upgrade_Script_System.ps1"
+```
+
+## Script Behavior
+
+### Compatible Systems
+- **Action**: Downloads and runs Windows 11 Installation Assistant
+- **Notifications**: Informs users that upgrade is starting
+- **Logging**: Records successful initiation of upgrade process
+
+### Incompatible Systems
+- **Action**: Creates monthly reminder alerts
+- **Notifications**: Warns users about compatibility issues
+- **Scheduled Task**: Creates recurring monthly alerts for all users
+- **Logging**: Details specific compatibility failures and recommendations
+
+### Already Windows 11 Systems
+- **Action**: No action required
+- **Notifications**: Confirms system is already up to date
+- **Logging**: Records current build number and completion
+
+## Logging
+
+### Standard Version
+- **Log Location**: `$env:TEMP\Win11Upgrade.log`
+- **Format**: `[Timestamp] [Level] Message`
+
+### System Version
+- **Log Location**: `$env:ProgramData\Win11Upgrade_System.log`
+- **Format**: `[Timestamp] [ComputerName] [Level] Message`
+- **Fallback**: Windows Event Log if file logging fails
+
+## Requirements
+
+- **PowerShell**: 5.1 or later
+- **Operating System**: Windows 10 (for upgrades) or Windows 11
+- **Privileges**: 
+  - Standard version: Local Administrator recommended
+  - System version: SYSTEM account (automatically provided by RMM tools)
+- **Network**: Internet access for downloading Microsoft tools
+
+## Troubleshooting
+
+### Common Issues
+1. **Execution Policy**: Scripts automatically set bypass for current session
+2. **Network Issues**: Scripts fall back to basic compatibility checks
+3. **Notification Failures**: System version has multiple fallback methods
+4. **Logging Failures**: System version falls back to Windows Event Log
+
+### Error Codes
+- **0**: Compatible, upgrade initiated successfully
+- **1**: Not compatible, alerts configured
+- **-1**: Error during compatibility check
+
+## Version History
+
+- **v1.2**: Enhanced compatibility logging, added UEFI and storage checks
+- **v1.3**: System edition for mass deployment via RMM tools
+
+## Support
+
+For issues or questions:
+1. Check logs at specified locations
+2. Verify network connectivity
+3. Ensure proper execution privileges
+4. Contact IT support for enterprise deployments
