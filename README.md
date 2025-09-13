@@ -1,6 +1,6 @@
 # System Administration Tools
 
-A collection of PowerShell scripts for Windows system administration, specifically focused on OneDrive migration and folder redirection management.
+A collection of PowerShell scripts for Windows system administration.
 
 ## Folders
 
@@ -54,8 +54,8 @@ Simple Windows 11 upgrade deployment script that downloads and runs the official
 win11_deploy_simple.bat
 ```
 
-### 🚀 Complete-OneDrive-Migration.ps1 (RECOMMENDED)
-**The comprehensive, all-in-one solution** that combines functionality from all other scripts into a single, optimized tool.
+### 🚀 Complete-OneDrive-Migration.ps1
+**The comprehensive, all-in-one solution to move away from folder redirecting** 
 
 **Features:**
 - ✅ Complete folder redirection cleanup (UNC paths, malformed GUIDs, H: drive references)
@@ -77,7 +77,7 @@ Legacy script for folder redirection cleanup. **Use Complete-OneDrive-Migration.
 
 ## Usage Examples
 
-### Basic Migration (Recommended)
+### Basic Migration
 ```powershell
 # Run the complete migration process
 .\Complete-OneDrive-Migration.ps1
@@ -230,12 +230,5 @@ flowchart TD
 - Comprehensive logging for audit trails
 - WhatIf mode allows safe testing
 
-## Version History
 
-- **v2.0** - Complete-OneDrive-Migration.ps1 (Combined functionality)
-- **v1.1** - Local-OD-Migrate-ADSHARE (Optimized, optional TenantID)
-- **v1.0** - Individual component scripts
 
----
-
-**Recommendation**: Use `Complete-OneDrive-Migration.ps1` for all new deployments. Legacy scripts are maintained for compatibility but the combined script provides superior functionality and error handling.
