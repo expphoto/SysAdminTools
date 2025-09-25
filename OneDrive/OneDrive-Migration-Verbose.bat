@@ -1,4 +1,5 @@
 @echo off
+setlocal EnableExtensions EnableDelayedExpansion
 REM Standalone OneDrive Migration Script for ScreenConnect
 REM Verbose version with comprehensive logging and OneDrive detection
 
@@ -39,6 +40,38 @@ echo [%DATE% %TIME%] Local AppData: %LOCALAPPDATA% >> "%LOG_FILE%"
 echo [%DATE% %TIME%] Home Share: %HOMESHARE% >> "%LOG_FILE%"
 echo [%DATE% %TIME%] Home Path: %HOMEPATH% >> "%LOG_FILE%"
 echo. >> "%LOG_FILE%"
+
+REM ===== STEP 0: ENFORCE ONEDRIVE KFM (OPTIONAL, USE TENANT ID) =====
+echo Step 0: OneDrive KFM policy configuration ^(optional^)...
+echo [%DATE% %TIME%] ===== STEP 0: ENFORCE ONEDRIVE KFM ===== >> "%LOG_FILE%"
+
+REM Paste your Tenant GUID between the quotes below on the live version
+set "TENANT_ID=PASTE TENANT ID"
+set "SCRIPT_DIR=%~dp0"
+set "COMPLETE_PS1=%SCRIPT_DIR%Complete-OneDrive-Migration.ps1"
+
+if /I "%TENANT_ID%"=="<PASTE_TENANT_GUID_HERE>" (
+    echo   - No TenantID provided; skipping KFM policy configuration
+    echo [%DATE% %TIME%] Skipping KFM policy: TENANT_ID not set >> "%LOG_FILE%"
+) else (
+    if exist "%COMPLETE_PS1%" (
+        echo   - Applying KFM policy via PowerShell script
+        echo [%DATE% %TIME%] Running PS1: "%COMPLETE_PS1%" -TenantID %TENANT_ID% -SkipDataMigration >> "%LOG_FILE%"
+        powershell -NoProfile -ExecutionPolicy Bypass -File "%COMPLETE_PS1%" -TenantID %TENANT_ID% -SkipDataMigration
+        set "PS1_EXIT=%errorlevel%"
+        echo [%DATE% %TIME%] Complete-OneDrive-Migration.ps1 exit code: !PS1_EXIT! >> "%LOG_FILE%"
+        if not "!PS1_EXIT!"=="0" (
+            echo   - WARNING: KFM policy script exited with code %PS1_EXIT%
+            echo [%DATE% %TIME%] WARNING: KFM policy script non-zero exit >> "%LOG_FILE%"
+        ) else (
+            echo   - KFM policy applied successfully
+            echo [%DATE% %TIME%] KFM policy applied successfully >> "%LOG_FILE%"
+        )
+    ) else (
+        echo   - PowerShell helper script not found: %COMPLETE_PS1%
+        echo [%DATE% %TIME%] PS1 not found at %COMPLETE_PS1% >> "%LOG_FILE%"
+    )
+)
 
 REM ===== STEP 1: FOLDER REDIRECTION CLEANUP =====
 echo Step 1: Cleaning up folder redirections...
@@ -517,16 +550,6 @@ echo Main log: %LOG_FILE%
 echo Robocopy logs: %LOG_DIR%\robocopy_*.log
 
 echo [%DATE% %TIME%] All log files saved to: %LOG_DIR% >> "%LOG_FILE%"
-
-REM Open log folder
-choice /C YN /M "Open log folder for review" /T 10 /D N
-if %errorlevel% equ 1 (
-    explorer "%LOG_DIR%"
-)
-
-echo.
-echo Press any key to exit...
-pause >nul
 exit /b 0
 
 REM ===== ERROR EXIT =====
@@ -539,7 +562,4 @@ echo [%DATE% %TIME%] ===========================================================
 echo [%DATE% %TIME%] MIGRATION FAILED >> "%LOG_FILE%"
 echo [%DATE% %TIME%] ============================================================ >> "%LOG_FILE%"
 echo Check the log file for details: %LOG_FILE%
-echo.
-echo Press any key to exit...
-pause >nul
 exit /b 1
