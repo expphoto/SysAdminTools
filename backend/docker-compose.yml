@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: voice-recorder-db
+    environment:
+      POSTGRES_USER: voiceapp
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_DB: transcripts
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voiceapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: voice-recorder-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Backend API Server
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voice-recorder-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://voiceapp:${DB_PASSWORD:-changeme}@postgres/transcripts
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-change-this-secret-key-in-production}
+      WHISPER_MODEL: ${WHISPER_MODEL:-medium.en}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cuda}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}
+      DEBUG: ${DEBUG:-false}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app  # Mount for development hot-reload
+      - whisper_models:/root/.cache/whisper
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy (optional, for production)
+  nginx:
+    image: nginx:alpine
+    container_name: voice-recorder-nginx
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  whisper_models:
+
+networks:
+  default:
+    name: voice-recorder-network

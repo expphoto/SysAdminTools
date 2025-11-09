@@ -1,0 +1,61 @@
+# Backend Server Requirements
+# Python 3.11+
+
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# WebSocket Support
+websockets==12.0
+
+# Database
+sqlalchemy==2.0.23
+asyncpg==0.29.0  # PostgreSQL async driver
+alembic==1.13.0  # Database migrations
+
+# Redis
+redis==5.0.1
+
+# Authentication & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.0
+
+# Data Validation
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Speech-to-Text (Whisper)
+# Choose one:
+# Option 1: Faster Whisper (recommended - 4x faster)
+faster-whisper==0.10.0
+
+# Option 2: Original OpenAI Whisper
+# openai-whisper==20231117
+# torch==2.1.1
+# torchaudio==2.1.1
+
+# Audio Processing
+librosa==0.10.1
+pydub==0.25.1
+numpy==1.26.2
+soundfile==0.12.1
+
+# Utilities
+python-dateutil==2.8.2
+httpx==0.25.2  # For async HTTP requests
+
+# Monitoring (Optional)
+prometheus-fastapi-instrumentator==6.1.0
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+
+# Logging
+loguru==0.7.2
+
+# Type Hints
+typing-extensions==4.9.0
