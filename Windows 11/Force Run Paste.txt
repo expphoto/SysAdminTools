@@ -1,1 +1,0 @@
-@echo off & powershell -NoP -EP Bypass -Command "iwr 'https://f001.backblazeb2.com/file/NinjaWebMedia/Windows11_Upgrade_Universal.ps1' -OutFile \"$env:TEMP\win11_universal.ps1\" -UseBasicParsing" & if exist "%TEMP%\win11_universal.ps1" (powershell -NoP -EP Bypass -File "%TEMP%\win11_universal.ps1" -Force & del "%TEMP%\win11_universal.ps1") & pause

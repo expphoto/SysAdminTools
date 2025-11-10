@@ -46,7 +46,7 @@ echo Step 0: OneDrive KFM policy configuration ^(optional^)...
 echo [%DATE% %TIME%] ===== STEP 0: ENFORCE ONEDRIVE KFM ===== >> "%LOG_FILE%"
 
 REM Paste your Tenant GUID between the quotes below on the live version
-set "TENANT_ID=PASTE TENANT ID"
+set "TENANT_ID=<PASTE_TENANT_GUID_HERE>"
 set "SCRIPT_DIR=%~dp0"
 set "COMPLETE_PS1=%SCRIPT_DIR%Complete-OneDrive-Migration.ps1"
 
@@ -194,6 +194,92 @@ if %errorlevel% equ 0 (
 
 echo   - Folder redirections reset completed
 echo [%DATE% %TIME%] Folder redirection cleanup completed >> "%LOG_FILE%"
+
+REM ===== STEP 1.5: ONEDRIVE KFM GUID CLEANUP =====
+echo Step 1.5: Cleaning up OneDrive Known Folder Move GUID mappings...
+echo [%DATE% %TIME%] ===== STEP 1.5: ONEDRIVE KFM GUID CLEANUP ===== >> "%LOG_FILE%"
+
+REM Define the GUID mappings to clean up
+echo   - Cleaning up OneDrive KFM GUID registry entries...
+echo [%DATE% %TIME%] Cleaning up OneDrive KFM GUID registry entries: >> "%LOG_FILE%"
+
+REM Documents folder GUID: {F42EE2D3-909F-4907-8871-4C22FC0BF756}
+echo     * Documents folder GUID cleanup (F42EE2D3-909F-4907-8871-4C22FC0BF756)
+reg delete "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" /v "{F42EE2D3-909F-4907-8871-4C22FC0BF756}" /f >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [%DATE% %TIME%] SUCCESS: Removed Documents GUID entry from User Shell Folders >> "%LOG_FILE%"
+) else (
+    echo [%DATE% %TIME%] INFO: Documents GUID entry not found or already removed >> "%LOG_FILE%"
+)
+
+REM Pictures folder GUID: {0DDD015D-B06C-45D5-8C4C-F59713854639}
+echo     * Pictures folder GUID cleanup (0DDD015D-B06C-45D5-8C4C-F59713854639)
+reg delete "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" /v "{0DDD015D-B06C-45D5-8C4C-F59713854639}" /f >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [%DATE% %TIME%] SUCCESS: Removed Pictures GUID entry from User Shell Folders >> "%LOG_FILE%"
+) else (
+    echo [%DATE% %TIME%] INFO: Pictures GUID entry not found or already removed >> "%LOG_FILE%"
+)
+
+REM Videos folder GUID: {35286A68-3C57-41A1-BBB1-0EAE73D76C95}
+echo     * Videos folder GUID cleanup (35286A68-3C57-41A1-BBB1-0EAE73D76C95)
+reg delete "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" /v "{35286A68-3C57-41A1-BBB1-0EAE73D76C95}" /f >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [%DATE% %TIME%] SUCCESS: Removed Videos GUID entry from User Shell Folders >> "%LOG_FILE%"
+) else (
+    echo [%DATE% %TIME%] INFO: Videos GUID entry not found or already removed >> "%LOG_FILE%"
+)
+
+REM Clean up OneDrive-specific KFM registry entries
+echo   - Cleaning up OneDrive KFM configuration entries...
+echo [%DATE% %TIME%] Cleaning up OneDrive KFM configuration entries: >> "%LOG_FILE%"
+
+REM Check for OneDrive accounts and clean KFM settings
+for /f "tokens=1" %%a in ('reg query "HKCU\SOFTWARE\Microsoft\OneDrive\Accounts" 2^>nul ^| findstr "HKCU"') do (
+    echo [%DATE% %TIME%] Processing OneDrive account: %%a >> "%LOG_FILE%"
+    
+    REM Remove KFM settings for Documents
+    reg delete "%%a\ScopeIdToMountPointPathCache" /v "{F42EE2D3-909F-4907-8871-4C22FC0BF756}" /f >nul 2>&1
+    if %errorlevel% equ 0 (
+        echo [%DATE% %TIME%] SUCCESS: Removed Documents KFM cache entry from %%a >> "%LOG_FILE%"
+    ) else (
+        echo [%DATE% %TIME%] INFO: Documents KFM cache entry not found in %%a >> "%LOG_FILE%"
+    )
+    
+    REM Remove KFM settings for Pictures
+    reg delete "%%a\ScopeIdToMountPointPathCache" /v "{0DDD015D-B06C-45D5-8C4C-F59713854639}" /f >nul 2>&1
+    if %errorlevel% equ 0 (
+        echo [%DATE% %TIME%] SUCCESS: Removed Pictures KFM cache entry from %%a >> "%LOG_FILE%"
+    ) else (
+        echo [%DATE% %TIME%] INFO: Pictures KFM cache entry not found in %%a >> "%LOG_FILE%"
+    )
+    
+    REM Remove KFM settings for Videos
+    reg delete "%%a\ScopeIdToMountPointPathCache" /v "{35286A68-3C57-41A1-BBB1-0EAE73D76C95}" /f >nul 2>&1
+    if %errorlevel% equ 0 (
+        echo [%DATE% %TIME%] SUCCESS: Removed Videos KFM cache entry from %%a >> "%LOG_FILE%"
+    ) else (
+        echo [%DATE% %TIME%] INFO: Videos KFM cache entry not found in %%a >> "%LOG_FILE%"
+    )
+    
+    REM Remove KFM configuration flags
+    reg delete "%%a\UserSettings" /v "KFMPersonalDesktop" /f >nul 2>&1
+    reg delete "%%a\UserSettings" /v "KFMPersonalDocuments" /f >nul 2>&1
+    reg delete "%%a\UserSettings" /v "KFMPersonalPictures" /f >nul 2>&1
+    reg delete "%%a\UserSettings" /v "KFMPersonalVideos" /f >nul 2>&1
+    reg delete "%%a\UserSettings" /v "KFMPersonalMusic" /f >nul 2>&1
+)
+
+REM Clean up any remaining OneDrive folder redirection policies
+echo   - Cleaning up OneDrive folder redirection policies...
+echo [%DATE% %TIME%] Cleaning up OneDrive folder redirection policies: >> "%LOG_FILE%"
+
+reg delete "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders" /v "{F42EE2D3-909F-4907-8871-4C22FC0BF756}" /f >nul 2>&1
+reg delete "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders" /v "{0DDD015D-B06C-45D5-8C4C-F59713854639}" /f >nul 2>&1
+reg delete "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders" /v "{35286A68-3C57-41A1-BBB1-0EAE73D76C95}" /f >nul 2>&1
+
+echo   - OneDrive KFM GUID cleanup completed
+echo [%DATE% %TIME%] OneDrive KFM GUID cleanup completed >> "%LOG_FILE%"
 
 REM Refresh Explorer
 echo   - Refreshing Explorer shell

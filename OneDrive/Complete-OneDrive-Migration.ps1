@@ -166,31 +166,67 @@ public static extern void SHChangeNotify(uint wEventId, uint uFlags, IntPtr dwIt
 function Enable-OneDriveKnownFolderMove {
     param([string]$TenantID)
     Write-Log "Configuring OneDrive Known Folder Move with TenantID: $TenantID"
-    
+
     try {
-        $OneDrivePolicyKey = "HKCU:\SOFTWARE\Policies\Microsoft\OneDrive"
-        if (-not (Test-Path $OneDrivePolicyKey)) { 
-            if ($WhatIf) {
-                Write-Log "WHATIF: Would create OneDrive policy registry key" -Level "INFO"
-            } else {
-                New-Item -Path $OneDrivePolicyKey -Force | Out-Null 
+        # 1) Machine-level policies to assist sign-in and Files On-Demand
+        $odMachinePolicyKey = "HKLM:\SOFTWARE\Policies\Microsoft\OneDrive"
+        if ($WhatIf) {
+            Write-Log "WHATIF: Would ensure $odMachinePolicyKey exists" -Level "INFO"
+        } else {
+            if (-not (Test-Path $odMachinePolicyKey)) { New-Item -Path $odMachinePolicyKey -Force | Out-Null }
+            # Silently sign in users to OneDrive with Windows credentials (where supported)
+            New-ItemProperty -Path $odMachinePolicyKey -Name "SilentAccountConfig" -Value 1 -PropertyType DWord -Force | Out-Null
+            # Enable Files On-Demand (recommended with KFM)
+            New-ItemProperty -Path $odMachinePolicyKey -Name "FilesOnDemandEnabled" -Value 1 -PropertyType DWord -Force | Out-Null
+        }
+
+        # 2) Resolve correct user hive. When run via RMM as SYSTEM, HKCU is not the target user.
+        $isSystem = ($env:USERNAME -eq 'SYSTEM')
+        $userHive = 'HKCU'
+        $userSid  = $null
+
+        if ($isSystem) {
+            try {
+                $explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($explorer) {
+                    $owner = (Get-WmiObject Win32_Process -Filter "ProcessId=$($explorer.Id)").GetOwner()
+                    if ($owner -and $owner.User) {
+                        $nt = New-Object System.Security.Principal.NTAccount("$($owner.Domain)", "$($owner.User)")
+                        $sidObj = $nt.Translate([System.Security.Principal.SecurityIdentifier])
+                        $userSid = $sidObj.Value
+                        $userHive = "HKU:$userSid"
+                        Write-Log "Detected interactive user $($owner.Domain)\$($owner.User) (SID: $userSid)"
+                    }
+                }
+            } catch {
+                Write-Log "Could not resolve interactive user hive: $($_.Exception.Message)" -Level "WARN"
             }
         }
-        
+
+        # Fall back to HKCU if we couldn't detect a different user hive
+        $oneDrivePolicyKey = (if ($userSid) { "$userHive\SOFTWARE\Policies\Microsoft\OneDrive" } else { "HKCU:\SOFTWARE\Policies\Microsoft\OneDrive" })
+
         if ($WhatIf) {
-            Write-Log "WHATIF: Would configure KFM policies for tenant $TenantID" -Level "INFO"
+            Write-Log "WHATIF: Would create user policy key $oneDrivePolicyKey" -Level "INFO"
+        } else {
+            if (-not (Test-Path $oneDrivePolicyKey)) { New-Item -Path $oneDrivePolicyKey -Force | Out-Null }
+        }
+
+        if ($WhatIf) {
+            Write-Log "WHATIF: Would configure KFM policies for tenant $TenantID in $oneDrivePolicyKey" -Level "INFO"
             return $true
         }
-        
-        # Set KFM policies with proper tenant ID
-        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMOptInWithWizard" -Value 1 -Type DWord -Force
-        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMSilentOptIn" -Value $TenantID -Type String -Force
-        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMSilentOptInDesktop" -Value 1 -Type DWord -Force
-        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMSilentOptInDocuments" -Value 1 -Type DWord -Force
-        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMSilentOptInPictures" -Value 1 -Type DWord -Force
-        Set-ItemProperty -Path $OneDrivePolicyKey -Name "KFMBlockOptOut" -Value 1 -Type DWord -Force
-        
-        Write-Log "OneDrive Known Folder Move policy configured successfully"
+
+        # 3) Set KFM user policies with proper tenant ID (enforced)
+        New-ItemProperty -Path $oneDrivePolicyKey -Name "KFMSilentOptIn" -Value $TenantID -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $oneDrivePolicyKey -Name "KFMSilentOptInDesktop" -Value 1 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $oneDrivePolicyKey -Name "KFMSilentOptInDocuments" -Value 1 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $oneDrivePolicyKey -Name "KFMSilentOptInPictures" -Value 1 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $oneDrivePolicyKey -Name "KFMBlockOptOut" -Value 1 -PropertyType DWord -Force | Out-Null
+
+        # Do not set KFMOptInWithWizard when using KFMSilentOptIn; silent opt-in takes precedence
+
+        Write-Log "OneDrive KFM policy configured at: $oneDrivePolicyKey"
         return $true
     } catch {
         Write-Log "Failed to configure OneDrive KFM: $($_.Exception.Message)" -Level "ERROR"
