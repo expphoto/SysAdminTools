@@ -1,0 +1,101 @@
+{
+  "normalization": {
+    "StripNumbersLongerThan": 5,
+    "StripGUIDs": true,
+    "StripBrackets": true,
+    "StripHexLike": true
+  },
+  "correlation": {
+    "windowMinutes": 90
+  },
+  "useCases": [
+    {
+      "name": "Database Errors",
+      "category": "Database",
+      "vendor": "SQL Server",
+      "priority": "high",
+      "match": {
+        "subjectIncludes": ["SQL", "database", "deadlock", "ORA-"],
+        "from": ["alerts@sql.example.com"]
+      },
+      "keywordsHigh": ["deadlock", "corruption", "redo log", "unrecoverable"]
+    },
+    {
+      "name": "Network Link Down",
+      "category": "Network",
+      "vendor": "Switch",
+      "priority": "high",
+      "match": {
+        "subjectIncludes": ["link down", "port down", "interface down"]
+      }
+    },
+    {
+      "name": "Build/Deploy Pipeline",
+      "category": "CI/CD",
+      "vendor": "Jenkins",
+      "priority": "low",
+      "match": {
+        "from": ["jenkins@", "ci@", "build@"],
+        "subjectIncludes": ["build", "deploy", "pipeline"]
+      }
+    }
+  ],
+  "ownerRules": [
+    {
+      "owner": "Networking",
+      "match": {
+        "subjectIncludes": [
+          "link down",
+          "bgp",
+          "latency",
+          "packet loss",
+          "vpn",
+          "firewall",
+          "dns",
+          "dhcp"
+        ],
+        "serverRegex": "^(sw|rt|fw|vpn|edge)"
+      }
+    },
+    {
+      "owner": "Development",
+      "match": {
+        "from": ["jenkins", "gitlab", "github"],
+        "subjectIncludes": ["build failed", "deploy", "pipeline", "merge"]
+      }
+    },
+    {
+      "owner": "Engineering",
+      "match": {
+        "subjectIncludes": [
+          "exception",
+          "stack trace",
+          "api",
+          "service",
+          "database",
+          "sql",
+          "oom",
+          "memory leak",
+          "timeout"
+        ]
+      }
+    },
+    {
+      "owner": "Admins",
+      "match": {
+        "subjectIncludes": [
+          "disk",
+          "cpu",
+          "memory",
+          "service stopped",
+          "backup",
+          "antivirus",
+          "patch",
+          "vmware",
+          "hyper-v",
+          "filesystem"
+        ]
+      }
+    }
+  ]
+}

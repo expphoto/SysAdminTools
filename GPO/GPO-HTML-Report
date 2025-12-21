@@ -1,0 +1,1237 @@
+# (param block removed)
+# Define the path to your XML file - update this to your actual path
+$xmlPath = "C:\Users\%username%\Downloads\AllGPOs.xml"
+
+# Validate file exists
+if (-not (Test-Path $xmlPath)) {
+    Write-Error "XML file not found at: $xmlPath"
+    exit
+}
+
+# Check file size
+$fileInfo = Get-Item $xmlPath
+if ($fileInfo.Length -eq 0) {
+    Write-Error "XML file is empty: $xmlPath"
+    exit
+}
+
+Write-Host "Found XML file: $($fileInfo.FullName) with size: $($fileInfo.Length) bytes"
+
+try {
+    # Import the XML file and strip default namespace to simplify parsing
+    $xmlRaw = Get-Content -Path $xmlPath -Raw -ErrorAction Stop
+    $xmlRaw = $xmlRaw -replace 'xmlns="[^"]+"', ''
+    $gpoXml = [xml]$xmlRaw
+    
+    # Determine the structure - handle different possible formats
+    $gpos = $null
+    
+    # Try different possible structures
+    if ($gpoXml.GPOs -and $gpoXml.GPOs.GPO) {
+        $gpos = $gpoXml.GPOs.GPO
+    } 
+    elseif ($gpoXml.DocumentElement.GPO) {
+        $gpos = $gpoXml.DocumentElement.GPO
+    }
+    elseif ($gpoXml.Report -and $gpoXml.Report.GPO) {
+        $gpos = $gpoXml.Report.GPO
+    }
+    else {
+        # As a last resort, try to find nodes named "GPO" anywhere in document
+        $gpoNodes = $gpoXml.SelectNodes("//GPO")
+        if ($gpoNodes.Count -gt 0) {
+            $gpos = $gpoNodes
+        }
+    }
+    
+    if ($gpos -eq $null -or $gpos.Count -eq 0) {
+        Write-Error "No GPO elements found in the XML file"
+        exit
+    }
+    
+    Write-Host "Found $($gpos.Count) GPO elements"
+    # Add this function at the beginning of the script, after the initial variable declarations:
+function Escape-RegexPattern {
+    param(
+        [string]$pattern
+    )
+    
+    # Escape special regex characters: \ ^ $ . | ? * + ( ) [ ] { }
+    $pattern = $pattern -replace '\\', '\\'
+    $pattern = $pattern -replace '\^', '\^'
+    $pattern = $pattern -replace '\$', '\$'
+    $pattern = $pattern -replace '\.', '\.'
+    $pattern = $pattern -replace '\|', '\|'
+    $pattern = $pattern -replace '\?', '\?'
+    $pattern = $pattern -replace '\*', '\*'
+    $pattern = $pattern -replace '\+', '\+'
+    $pattern = $pattern -replace '\(', '\('
+    $pattern = $pattern -replace '\)', '\)'
+    $pattern = $pattern -replace '\[', '\['
+    $pattern = $pattern -replace '\]', '\]'
+    $pattern = $pattern -replace '\{', '\{'
+    $pattern = $pattern -replace '\}', '\}'
+    
+    return $pattern
+}
+
+# Helper function to flatten XML structure for raw XML dump (for detailed mode)
+function Flatten-XmlNode {
+    param(
+        [System.Xml.XmlNode]$node,
+        [string]$path = ""
+    )
+    $output = @()
+    foreach ($child in $node.ChildNodes) {
+        $childPath = if ($path) { "$path/$($child.Name)" } else { $child.Name }
+        if ($child.Attributes) {
+            foreach ($attr in $child.Attributes) {
+                $output += "$childPath[@$($attr.Name)='$($attr.Value)']"
+            }
+        }
+        if ($child.ChildNodes.Count -eq 1 -and $child.InnerText.Trim()) {
+            $output += "$($childPath): $($child.InnerText.Trim())"
+        }
+        $output += Flatten-XmlNode -node $child -path $childPath
+    }
+    return $output
+}
+    # Define policy categories and their keywords
+    $policyCategories = @{
+        "Security" = @(
+            "Password", "Account Lockout", "Audit", "Security", "Firewall", 
+            "User Rights", "Credential", "UAC", "Encryption", "BitLocker", 
+            "AppLocker", "Defender", "SmartScreen", "Antivirus", "MFA", "Authentication"
+        )
+        "Network" = @(
+            "Network", "Firewall", "VPN", "Proxy", "DNS", "DHCP", "WiFi", 
+            "Adapter", "Ethernet", "IPsec", "TCP/IP", "WinRM", "RDP", "Remote",
+            "Wireless", "Bluetooth", "Internet", "Connection"
+        )
+        "Application" = @(
+            "Software", "Application", "App", "Package", "Installation", 
+            "Program", "Office", "Edge", "Chrome", "Firefox", "IE", "Teams", 
+            "OneDrive", "Outlook", "Software Restriction", "App Control"
+        )
+        "Desktop" = @(
+            "Desktop", "Start Menu", "Taskbar", "Theme", "Wallpaper", "Display", 
+            "Screen Saver", "Font", "Power", "Sleep", "Lock Screen", "UI", "Interface",
+            "Personalization", "Visual"
+        )
+        "Printer" = @(
+            "Printer", "Print", "Spool", "Spooler", "Scanner", "Fax"
+        )
+        "Device" = @(
+            "Device", "Hardware", "Driver", "USB", "Removable", "Bluetooth", 
+            "Camera", "Microphone", "Peripheral", "Storage", "External", "Audio",
+            "Video", "Multimedia"
+        )
+        "Windows Update" = @(
+            "Update", "WSUS", "Patch", "Windows Update", "Upgrade", "Service Pack"
+        )
+        "Folder Redirection" = @(
+            "Folder Redirection", "Redirect", "Documents", "Desktop Folder", "Libraries",
+            "Personal Folders", "Profile", "Home Directory"
+        )
+        "Scripts" = @(
+            "Script", "Startup", "Logon", "PowerShell", "Batch", "VBScript",
+            "Logoff", "Shutdown", "Automation"
+        )
+        "Administrative Templates" = @(
+            "Administrative Templates", "ADMX", "ADML", "Registry Policy", "Setting", "Option"
+        )
+        "Compliance" = @(
+            "Compliance", "Regulatory", "Requirement", "Standard", "Baseline"
+        )
+    }
+    
+    # Create categorized collections
+    $report = @{}
+    foreach ($category in $policyCategories.Keys) {
+        $report[$category] = @()
+    }
+    $report["User Policies"] = @()
+    $report["Computer Policies"] = @()
+    $report["Other Policies"] = @()
+    
+    # Create master collection to hold all GPO objects for analysis
+    $allGpos = @()
+    
+    # Function to extract detailed policy settings
+    function Get-PolicyDetails {
+        param($gpo)
+        
+        $details = @()
+        $settingsMap = @{}
+        
+        # Check for Computer Configuration settings
+        if ($gpo.Computer) {
+            # Registry settings
+            if ($gpo.Computer.ExtensionData) {
+                $settingsMap["ComputerRegistry"] = @()
+                
+                foreach ($extData in $gpo.Computer.ExtensionData) {
+                    # Registry settings
+                    if ($extData.Extension.RegistrySettings.Registry) {
+                        foreach ($reg in $extData.Extension.RegistrySettings.Registry) {
+                            $settingsMap["ComputerRegistry"] += "$($reg.KeyPath) - $($reg.Name): $($reg.Value)"
+                            $details += "Registry: $($reg.KeyPath) - $($reg.Name)"
+                        }
+                    }
+                    
+                    # Security options
+                    if ($extData.Extension.SecurityOptions) {
+                        $settingsMap["SecurityOptions"] = @()
+                        foreach ($sec in $extData.Extension.SecurityOptions.SecurityOption) {
+                            $settingsMap["SecurityOptions"] += "$($sec.Name): $($sec.SettingString)"
+                            $details += "Security: $($sec.Name)"
+                        }
+                    }
+                    
+                    # User Rights
+                    if ($extData.Extension.UserRightsAssignment) {
+                        $settingsMap["UserRights"] = @()
+                        foreach ($right in $extData.Extension.UserRightsAssignment.UserRightsAssignment) {
+                            $members = if ($right.Member) { 
+                                ($right.Member | ForEach-Object { 
+                                    if ($_.Name.'#text') { $_.Name.'#text' } else { $_.Name } 
+                                }) -join ", " 
+                            } else { "None" }
+                            
+                            $settingsMap["UserRights"] += "$($right.Name): $members"
+                            $details += "User Right: $($right.Name)"
+                        }
+                    }
+                    
+                    # System Services
+                    if ($extData.Extension.ServiceSettings) {
+                        $settingsMap["Services"] = @()
+                        foreach ($svc in $extData.Extension.ServiceSettings.Service) {
+                            $settingsMap["Services"] += "$($svc.Name): $($svc.StartupType)"
+                            $details += "Service: $($svc.Name) - $($svc.StartupType)"
+                        }
+                    }
+                    
+                    # Firewall settings
+                    if ($extData.Extension.FirewallSettings) {
+                        $settingsMap["Firewall"] = @("Firewall settings configured")
+                        $details += "Firewall Settings Present"
+                    }
+                    
+                    # Software installation
+                    if ($extData.Extension.AssignmentSoftwareInstallation) {
+                        $settingsMap["ComputerSoftware"] = @()
+                        foreach ($sw in $extData.Extension.AssignmentSoftwareInstallation.SoftwareInstallation) {
+                            $settingsMap["ComputerSoftware"] += "$($sw.Name)"
+                        }
+                        $details += "Software Installation Present"
+                    }
+                    
+                    # Administrative Templates
+                    if ($extData.Extension.PolicySettings) {
+                        $settingsMap["ComputerAdmTemplates"] = @()
+                        foreach ($policy in $extData.Extension.PolicySettings.Policy) {
+                            $settingsMap["ComputerAdmTemplates"] += "$($policy.Name): $($policy.State)"
+                            $details += "Policy: $($policy.Name) - $($policy.State)"
+                        }
+                    }
+                }
+            }
+        }
+        
+        # Check for User Configuration settings
+        if ($gpo.User) {
+            # Registry settings
+            if ($gpo.User.ExtensionData) {
+                $settingsMap["UserRegistry"] = @()
+                
+                foreach ($extData in $gpo.User.ExtensionData) {
+                    # Registry settings
+                    if ($extData.Extension.RegistrySettings.Registry) {
+                        foreach ($reg in $extData.Extension.RegistrySettings.Registry) {
+                            $settingsMap["UserRegistry"] += "$($reg.KeyPath) - $($reg.Name): $($reg.Value)"
+                            $details += "User Registry: $($reg.KeyPath) - $($reg.Name)"
+                        }
+                    }
+                    
+                    # Folder Redirection
+                    if ($extData.Extension.FolderRedirection) {
+                        $settingsMap["FolderRedirection"] = @()
+                        foreach ($folder in $extData.Extension.FolderRedirection.Folder) {
+                            $settingsMap["FolderRedirection"] += "$($folder.Name): $($folder.Path)"
+                            $details += "Folder Redirection: $($folder.Name)"
+                        }
+                    }
+                    
+                    # Internet Settings
+                    if ($extData.Extension.InternetSettings) {
+                        $settingsMap["InternetSettings"] = @("Internet Settings Present")
+                        $details += "Internet Settings Present"
+                    }
+                    
+                    # Software installation
+                    if ($extData.Extension.AssignmentSoftwareInstallation) {
+                        $settingsMap["UserSoftware"] = @()
+                        foreach ($sw in $extData.Extension.AssignmentSoftwareInstallation.SoftwareInstallation) {
+                            $settingsMap["UserSoftware"] += "$($sw.Name)"
+                        }
+                        $details += "User Software Installation Present"
+                    }
+                    
+                    # Administrative Templates
+                    if ($extData.Extension.PolicySettings) {
+                        $settingsMap["UserAdmTemplates"] = @()
+                        foreach ($policy in $extData.Extension.PolicySettings.Policy) {
+                            $settingsMap["UserAdmTemplates"] += "$($policy.Name): $($policy.State)"
+                            $details += "User Policy: $($policy.Name) - $($policy.State)"
+                        }
+                    }
+                }
+            }
+        }
+        
+# Fallback: parse AuditEntry XML nodes for true detail
+if ($details.Count -eq 0) {
+    $xmlNode = [xml]$gpo.OuterXml
+    $auditEntries = $xmlNode.SelectNodes("//AuditEntry")
+    if ($auditEntries.Count -gt 0) {
+        $settingsMap["AuditSettings"] = @()
+        foreach ($entry in $auditEntries) {
+            $cat = $entry.Category
+            $succ = $entry.Success
+            $fail = $entry.Failure
+            $settingsMap["AuditSettings"] += "$($cat) - Success: $($succ), Failure: $($fail)"
+            $details += "Audit - $($cat): Success=$($succ), Failure=$($fail)"
+        }
+    }
+}
+    # (generic keyword fallback removed)
+
+        # Always include raw XML dump for discovery
+        $xmlDoc = [xml]$gpo.OuterXml
+        $rawList = Flatten-XmlNode -node $xmlDoc.DocumentElement
+        $settingsMap["RawXml"] = $rawList
+        foreach ($item in $rawList) { $details += $item }
+        
+        # Return both the summary details and the full settings map
+        return @{
+            SummaryDetails = ($details | Select-Object -Unique)
+            FullSettings   = $settingsMap
+        }
+    }
+    
+    # Function to determine the best category
+    function Get-BestCategory {
+        param(
+            $gpoName,
+            $gpoDetails,
+            $allText
+        )
+        
+        # Create a scoring system for categories
+        $categoryScores = @{}
+        foreach ($category in $policyCategories.Keys) {
+            $categoryScores[$category] = 0
+            
+            # Check if any keywords match in the GPO name (high weight)
+            foreach ($keyword in $policyCategories[$category]) {
+                if ($gpoName -match $keyword) {
+                    $categoryScores[$category] += 3
+                }
+            }
+            
+            # Check if any keywords match in the GPO details (medium weight)
+            foreach ($detail in $gpoDetails) {
+                foreach ($keyword in $policyCategories[$category]) {
+                    if ($detail -match $keyword) {
+                        $categoryScores[$category] += 2
+                    }
+                }
+            }
+            
+            # Check if any keywords match in all text (low weight)
+            foreach ($keyword in $policyCategories[$category]) {
+                if ($allText -match $keyword) {
+                    $categoryScores[$category] += 1
+                }
+            }
+        }
+        
+        # Return the category with the highest score, if any score is > 0
+        $bestCategory = $categoryScores.GetEnumerator() | 
+                        Where-Object { $_.Value -gt 0 } | 
+                        Sort-Object -Property Value -Descending | 
+                        Select-Object -First 1
+        
+        if ($bestCategory) {
+            return $bestCategory.Key
+        }
+        
+        # Default categorization based on settings
+        if ($gpo.Computer.Enabled -eq 'true') {
+            return "Computer Policies"
+        }
+        elseif ($gpo.User.Enabled -eq 'true') {
+            return "User Policies"
+        }
+        else {
+            return "Other Policies"
+        }
+    }
+    
+    # Parse each GPO and categorize it
+    foreach ($gpo in $gpos) {
+        try {
+            # Extract basic info - handling different possible structures
+            $gpoName = $gpo.Name
+            $gpoID = if ($gpo.Identifier.Identifier.'#text') { $gpo.Identifier.Identifier.'#text' } 
+                    elseif ($gpo.Identifier.'#text') { $gpo.Identifier.'#text' }
+                    else { $gpo.id }
+            
+            $gpoDesc = if ($gpo.Description.'#text') { $gpo.Description.'#text' } 
+                      else { $gpo.Description }
+            
+            $computerEnabled = if ($gpo.Computer.Enabled) { $gpo.Computer.Enabled -eq 'true' }
+                              else { $true } # Default to true if not specified
+            
+            $userEnabled = if ($gpo.User.Enabled) { $gpo.User.Enabled -eq 'true' }
+                          else { $true } # Default to true if not specified
+            
+            # Get policy details
+            $policyDetailsObj = Get-PolicyDetails -gpo $gpo
+            $policyDetails = $policyDetailsObj.SummaryDetails
+            $fullSettings = $policyDetailsObj.FullSettings
+            
+            # Get creation and modification info if available
+            $createdDate = if ($gpo.CreatedTime) { $gpo.CreatedTime } else { "Unknown" }
+            $modifiedDate = if ($gpo.ModifiedTime) { $gpo.ModifiedTime } else { "Unknown" }
+            $createdBy = if ($gpo.CreatedBy) { $gpo.CreatedBy } else { "Unknown" }
+            
+            # Create GPO info object
+            $gpoInfo = [PSCustomObject]@{
+                Name = $gpoName
+                ID = $gpoID
+                Description = $gpoDesc
+                ComputerSettingsEnabled = $computerEnabled
+                UserSettingsEnabled = $userEnabled
+                Details = $policyDetails
+                FullSettings = $fullSettings
+                CreatedDate = $createdDate
+                ModifiedDate = $modifiedDate
+                CreatedBy = $createdBy
+                Links = @()
+                Unused        = $false
+                Category = $category
+                SettingCount = 0
+                Complexity = "Low" # Default
+                Impact = "Low" # Default
+                ConsolidationTargets = @()
+                ConsolidationRecommendation = ""
+                AllText = $gpo.OuterXml
+            }
+            
+            # Calculate setting count and complexity
+            $settingCount = 0
+            foreach ($key in $fullSettings.Keys) {
+                $settingCount += $fullSettings[$key].Count
+            }
+            $gpoInfo.SettingCount = $settingCount
+            
+            # Determine complexity based on setting count
+            if ($settingCount -gt 50) {
+                $gpoInfo.Complexity = "High"
+            } elseif ($settingCount -gt 20) {
+                $gpoInfo.Complexity = "Medium"
+            }
+            
+            # Try to extract links - handle different possible structures
+            if ($gpo.LinksTo) {
+                if ($gpo.LinksTo.SOMPath) {
+                    $gpoInfo.Links = @($gpo.LinksTo.SOMPath)
+                }
+                elseif ($gpo.LinksTo.SOM) {
+                    $gpoInfo.Links = @($gpo.LinksTo.SOM | ForEach-Object { $_.Path })
+                }
+            }
+            
+            # Determine the best category for this GPO
+            $allText = $gpo.OuterXml
+            $category = Get-BestCategory -gpoName $gpoName -gpoDetails $policyDetails -allText $allText
+            
+            # Determine impact
+            if ($category -eq "Security" -or $gpoName -match "Security|Compliance|Baseline") {
+                $gpoInfo.Impact = "High"
+            } elseif ($gpoInfo.Links.Count -gt 5 -or $gpoInfo.SettingCount -gt 30) {
+                $gpoInfo.Impact = "Medium"
+            }
+            
+            # Add to the appropriate category
+            $report[$category] += $gpoInfo
+            
+            # Add to master collection for analysis
+            $allGpos += $gpoInfo
+        }
+        catch {
+            Write-Warning "Error processing GPO: $($gpo.Name). Error: $_"
+        }
+    }
+    
+    # Output diagnostic information about categorized GPOs
+    Write-Host "`nGPO Categorization Results:"
+    foreach ($category in $report.Keys) {
+        Write-Host "  $category`: $($report[$category].Count) policies"
+    }
+    
+    # Analysis: Identify potential consolidation targets
+    function Find-ConsolidationTargets {
+        param(
+            $allGpos
+        )
+        
+        Write-Host "`nAnalyzing GPOs for potential consolidation..."
+        
+        # Group GPOs by category for analysis
+        $gposByCategory = @{}
+        foreach ($gpo in $allGpos) {
+            foreach ($category in $report.Keys) {
+                if ($report[$category] -contains $gpo) {
+                    if (-not $gposByCategory[$category]) {
+                        $gposByCategory[$category] = @()
+                    }
+                    $gposByCategory[$category] += $gpo
+                    break
+                }
+            }
+        }
+        
+        # Create similarity pairs
+        foreach ($category in $gposByCategory.Keys) {
+            $categoryGpos = $gposByCategory[$category]
+            
+            # Skip categories with only 1 or no GPOs
+            if ($categoryGpos.Count -le 1) {
+                continue
+            }
+            
+            for ($i = 0; $i -lt $categoryGpos.Count; $i++) {
+                $gpo1 = $categoryGpos[$i]
+                
+                for ($j = $i + 1; $j -lt $categoryGpos.Count; $j++) {
+                    $gpo2 = $categoryGpos[$j]
+                    
+                    # Skip comparison if either GPO has a consolidation recommendation already
+                    if ($gpo1.ConsolidationRecommendation -or $gpo2.ConsolidationRecommendation) {
+                        continue
+                    }
+                    
+                    # Check for similar or overlapping settings
+                    $similarityScore = 0
+                    $evidencePoints = @()
+                    
+                    # Name similarity (using regex to escape special characters)
+                    $escapedName2 = [regex]::Escape($gpo2.Name)
+                    $escapedName1 = [regex]::Escape($gpo1.Name)
+                    if ($gpo1.Name -match $escapedName2 -or $gpo2.Name -match $escapedName1) {
+                        $similarityScore += 3
+                        $evidencePoints += "Similar names: '$($gpo1.Name)' and '$($gpo2.Name)'"
+                    }
+                    
+                    # Description similarity (using regex to escape special characters)
+                    if ($gpo1.Description -and $gpo2.Description) {
+                        $escapedDesc2 = [regex]::Escape($gpo2.Description)
+                        $escapedDesc1 = [regex]::Escape($gpo1.Description)
+                        if ($gpo1.Description -match $escapedDesc2 -or $gpo2.Description -match $escapedDesc1) {
+                            $similarityScore += 2
+                            $evidencePoints += "Similar descriptions"
+                        }
+                    }
+                    
+                    # Link similarity - both GPOs linked to same OUs
+                    $commonLinks = @($gpo1.Links | Where-Object { $gpo2.Links -contains $_ })
+                    if ($commonLinks.Count -gt 0) {
+                        $similarityScore += 3
+                        $evidencePoints += "Linked to the same OUs: $($commonLinks -join ', ')"
+                    }
+                    
+                    # Settings overlap
+                    foreach ($settingType in $gpo1.FullSettings.Keys) {
+                        if ($settingType -eq "RawXml") { continue }
+                        if ($gpo2.FullSettings.ContainsKey($settingType)) {
+                            $similarityScore += 2
+                            $evidencePoints += "Both GPOs have $settingType settings"
+                            
+                            # Check for specific overlapping settings
+                            foreach ($setting in $gpo1.FullSettings[$settingType]) {
+                                $settingKey = $setting -replace ":.*$", ""
+                                foreach ($setting2 in $gpo2.FullSettings[$settingType]) {
+                                    if ($setting2 -like "$settingKey*") {
+                                        $similarityScore += 3
+                                        $evidencePoints += "Overlapping setting: $settingKey"
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    # Skip consolidation if GPO categories differ
+                    if ($gpo1.Category -ne $gpo2.Category) {
+                        continue
+                    }
+                    # Consider for consolidation if similarity score is high enough
+                    if ($similarityScore -ge 5) {
+                        $gpo1.ConsolidationTargets += $gpo2.Name
+                        $gpo2.ConsolidationTargets += $gpo1.Name
+                        
+                        # Determine which GPO should absorb the other
+                        $primaryGpo = if ($gpo1.SettingCount -ge $gpo2.SettingCount) { $gpo1 } else { $gpo2 }
+                        $secondaryGpo = if ($primaryGpo -eq $gpo1) { $gpo2 } else { $gpo1 }
+                        
+                        $recommendation = "Consider consolidating with '$($secondaryGpo.Name)'. Evidence: $($evidencePoints -join '; ')"
+                        $primaryGpo.ConsolidationRecommendation = $recommendation
+                        
+                        Write-Host "  Potential consolidation: $($gpo1.Name) and $($gpo2.Name) - Score: $similarityScore"
+                    }
+                }
+            }
+        }
+        
+        # Look for small GPOs with few settings that could be consolidated into larger ones
+        foreach ($category in $gposByCategory.Keys) {
+            $categoryGpos = $gposByCategory[$category]
+            $smallGpos = $categoryGpos | Where-Object { $_.SettingCount -le 10 -and -not $_.ConsolidationRecommendation }
+            $largeGpos = $categoryGpos | Where-Object { $_.SettingCount -gt 10 }
+            
+            foreach ($smallGpo in $smallGpos) {
+                foreach ($largeGpo in $largeGpos) {
+                    # Skip if already has recommendation
+                    if ($smallGpo.ConsolidationRecommendation) {
+                        continue
+                    }
+                    
+                    # Check if they share any links
+                    $commonLinks = @($smallGpo.Links | Where-Object { $largeGpo.Links -contains $_ })
+                    if ($commonLinks.Count -gt 0) {
+                        $smallGpo.ConsolidationTargets += $largeGpo.Name
+                        $smallGpo.ConsolidationRecommendation = "Consider consolidating this small GPO into the larger '$($largeGpo.Name)' as they share links to: $($commonLinks -join ', ')"
+                        Write-Host "  Small GPO consolidation: $($smallGpo.Name) could be merged into $($largeGpo.Name)"
+                    }
+                }
+            }
+        }
+        
+        # Look for redundant settings across categories
+        $criticalSettings = @(
+            "Password Policy",
+            "Account Lockout Policy",
+            "User Rights Assignment",
+            "Security Options",
+            "Windows Defender",
+            "Firewall Rules"
+        )
+        
+        $settingPresence = @{}
+        foreach ($criticalSetting in $criticalSettings) {
+            $settingPresence[$criticalSetting] = @()
+        }
+        
+        foreach ($gpo in $allGpos) {
+            foreach ($criticalSetting in $criticalSettings) {
+                if (($gpo.AllText -match $criticalSetting) -or 
+                    ($gpo.Details -like "*$criticalSetting*")) {
+                    $settingPresence[$criticalSetting] += $gpo
+                }
+            }
+        }
+        
+        # Report potentially redundant critical settings
+        foreach ($criticalSetting in $criticalSettings) {
+            $gposWithSetting = $settingPresence[$criticalSetting]
+            if ($gposWithSetting.Count -gt 1) {
+                Write-Host "  Warning: $criticalSetting appears in multiple GPOs: $($gposWithSetting.Name -join ', ')"
+                
+                # Add recommendation to the GPOs
+                foreach ($gpo in $gposWithSetting) {
+                    if (-not $gpo.ConsolidationRecommendation) {
+                        $otherGpos = ($gposWithSetting | Where-Object { $_ -ne $gpo }).Name -join ', '
+                        $gpo.ConsolidationRecommendation = "Critical setting '$criticalSetting' may conflict with other GPOs: $otherGpos"
+                    }
+                }
+            }
+        }
+    }
+    
+    # Run consolidation analysis
+    Find-ConsolidationTargets -allGpos $allGpos
+    
+    # Generate summary statistics for the report
+    $summaryStats = @{
+        TotalGPOs = $allGpos.Count
+        HighImpactGPOs = ($allGpos | Where-Object { $_.Impact -eq "High" }).Count
+        HighComplexityGPOs = ($allGpos | Where-Object { $_.Complexity -eq "High" }).Count
+        ConsolidationCandidates = ($allGpos | Where-Object { $_.ConsolidationRecommendation }).Count
+        LargestCategory = ($report.Keys | Sort-Object { $report[$_].Count } -Descending | Select-Object -First 1)
+        AverageSettingsPerGPO = [math]::Round(($allGpos | Measure-Object -Property SettingCount -Average).Average, 2)
+        ComputerSettingsGPOs = ($allGpos | Where-Object { $_.ComputerSettingsEnabled }).Count
+        UserSettingsGPOs = ($allGpos | Where-Object { $_.UserSettingsEnabled }).Count
+        BothSettingsGPOs = ($allGpos | Where-Object { $_.ComputerSettingsEnabled -and $_.UserSettingsEnabled }).Count
+        UnusedPolicies = ($allGpos | Where-Object { $_.Unused }).Count
+    }
+
+    # Build a map of location (OU path) to GPO names
+    $linksMap = @{}
+    foreach ($gpo in $allGpos) {
+        foreach ($link in $gpo.Links) {
+            if (-not $linksMap.ContainsKey($link)) {
+                $linksMap[$link] = @()
+            }
+            $linksMap[$link] += $gpo.Name
+        }
+    }
+    
+    # Export to HTML report
+    $htmlReport = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Comprehensive GPO Analysis and Consolidation Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; color: #333; }
+        h1, h2, h3 { color: #0066cc; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 30px; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
+        tr:hover { background-color: #f5f5f5; }
+        th { background-color: #0066cc; color: white; position: sticky; top: 0; }
+        .empty { color: #888; font-style: italic; }
+        .summary { background-color: #f0f0f0; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+        .details { font-size: 0.9em; color: #555; }
+        .details ul { margin-top: 5px; margin-bottom: 5px; }
+        .category-info { background-color: #e9f2ff; padding: 10px; margin-bottom: 15px; border-left: 4px solid #0066cc; }
+        .recommendation { background-color: #ffe9e9; padding: 10px; margin: 10px 0; border-left: 4px solid #cc0000; }
+        .high-impact { background-color: #ffecec; }
+        .high-complexity { background-color: #fff9ec; }
+        .consolidation { background-color: #f0fff0; }
+        .tabs { overflow: hidden; border: 1px solid #ccc; background-color: #f1f1f1; }
+        .tabs button { background-color: inherit; float: left; border: none; outline: none; cursor: pointer; padding: 10px 16px; }
+        .tabs button:hover { background-color: #ddd; }
+        .tabs button.active { background-color: #0066cc; color: white; }
+        .tabcontent { display: none; padding: 6px 12px;
+        .tabcontent { display: none; padding: 6px 12px; border: 1px solid #ccc; border-top: none; }
+       .chart-container { width: 600px; height: 400px; margin: 20px auto; }
+       .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; margin-left: 5px; }
+       .badge-high { background-color: #ffcccc; color: #cc0000; }
+       .badge-medium { background-color: #fff8cc; color: #cc7a00; }
+       .badge-low { background-color: #e6f2ff; color: #0066cc; }
+       details { margin: 10px 0; padding: 10px; background-color: #f9f9f9; border-radius: 5px; }
+       details summary { font-weight: bold; cursor: pointer; }
+       .tooltip { position: relative; display: inline-block; border-bottom: 1px dotted black; }
+       .tooltip .tooltiptext { visibility: hidden; width: 200px; background-color: #555; color: #fff; text-align: center; border-radius: 6px; padding: 5px; position: absolute; z-index: 1; bottom: 125%; left: 50%; margin-left: -100px; opacity: 0; transition: opacity 0.3s; }
+       .tooltip:hover .tooltiptext { visibility: visible; opacity: 1; }
+       .search-box { padding: 10px; margin: 10px 0; width: 100%; box-sizing: border-box; }
+       #gpo-filter { padding: 8px; width: 100%; font-size: 16px; border: 1px solid #ddd; border-radius: 4px; }
+       .quick-stats { display: flex; flex-wrap: wrap; justify-content: space-between; margin-bottom: 20px; }
+       .stat-card { flex-basis: 23%; background-color: #f5f5f5; padding: 15px; margin-bottom: 15px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); text-align: center; }
+       .stat-number { font-size: 24px; font-weight: bold; color: #0066cc; margin: 5px 0; }
+       .exec-summary { background-color: #fff8e1; padding: 15px; margin: 20px 0; border-left: 4px solid #ffc107; }
+       .warning { background-color: #fff2f2; padding: 10px; margin: 10px 0; border-left: 4px solid #ff4d4d; }
+       .raw-xml { display: none; }
+       @media print {
+           .tabs, .tabs button { display: none; }
+           .tabcontent { display: block !important; }
+           details { page-break-inside: avoid; }
+           details[open] summary { display: none; }
+           details[open] { padding: 0; margin: 0; border: none; }
+           .search-box { display: none; }
+       }
+   </style>
+   <script>
+       function filterGPOs(el) {
+           var filter = el.value.toUpperCase();
+           const tables = document.getElementsByTagName('table');
+           
+           for (let t = 0; t < tables.length; t++) {
+               const table = tables[t];
+               const rows = table.getElementsByTagName('tr');
+               
+               for (let i = 1; i < rows.length; i++) { // Start from 1 to skip header row
+                   const nameCell = rows[i].getElementsByTagName('td')[0];
+                   if (nameCell) {
+                       const name = nameCell.textContent || nameCell.innerText;
+                       if (name.toUpperCase().indexOf(filter) > -1) {
+                           rows[i].style.display = '';
+                       } else {
+                           rows[i].style.display = 'none';
+                       }
+                   }
+               }
+           }
+           // Also filter details blocks in Detailed Analysis
+           const detailBlocks = document.getElementsByTagName('details');
+           for (let d = 0; d < detailBlocks.length; d++) {
+               const detail = detailBlocks[d];
+               const summary = detail.querySelector('summary').innerText || '';
+               if (summary.toUpperCase().indexOf(filter) > -1) {
+                   detail.style.display = '';
+               } else {
+                   detail.style.display = 'none';
+               }
+           }
+       }
+       
+       function openTab(evt, tabName) {
+           var i, tabcontent, tablinks;
+           tabcontent = document.getElementsByClassName('tabcontent');
+           for (i = 0; i < tabcontent.length; i++) {
+               tabcontent[i].style.display = 'none';
+           }
+           tablinks = document.getElementsByClassName('tablinks');
+           for (i = 0; i < tablinks.length; i++) {
+               tablinks[i].className = tablinks[i].className.replace(' active', '');
+           }
+           document.getElementById(tabName).style.display = 'block';
+           evt.currentTarget.className += ' active';
+       }
+       
+       window.onload = function() {
+           // Open the first tab by default
+           document.getElementsByClassName('tablinks')[0].click();
+       }
+   </script>
+</head>
+<body>
+   <h1>Comprehensive GPO Analysis and Consolidation Report</h1>
+   <div style="margin-bottom:15px;">
+     <label><input type="checkbox" id="verboseToggle" onchange="toggleVerbose(this)"> Show verbose details</label>
+   </div>
+   
+   <div class="exec-summary">
+       <h2>Executive Summary</h2>
+       <p>This report provides a detailed analysis of Group Policy Objects (GPOs) in your environment, including categorization, potential consolidation opportunities, and recommendations for optimization.</p>
+       <p><strong>Key Findings:</strong></p>
+       <ul>
+           <li>Total GPOs: $($summaryStats.TotalGPOs)</li>
+           <li>High Impact GPOs: $($summaryStats.HighImpactGPOs) (requiring careful testing before modification)</li>
+           <li>Consolidation Candidates: $($summaryStats.ConsolidationCandidates) (GPOs that could potentially be merged)</li>
+           <li>Largest Category: $($summaryStats.LargestCategory) with $($report[$summaryStats.LargestCategory].Count) GPOs</li>
+           <li>Unused GPOs: $($summaryStats.UnusedPolicies)</li>
+       </ul>
+   </div>
+   
+   <div class="tabs">
+       <button class="tablinks" onclick="openTab(event, 'summary')">Summary</button>
+       <button class="tablinks" onclick="openTab(event, 'consolidation')">Consolidation Opportunities</button>
+       <button class="tablinks" onclick="openTab(event, 'categories')">Categories</button>
+       <button class="tablinks" onclick="openTab(event, 'links')">Links</button>
+       <button class="tablinks" onclick="openTab(event, 'details')">Detailed GPO Analysis</button>
+   </div>
+   
+   <div id="summary" class="tabcontent">
+       <h2>GPO Environment Summary</h2>
+       
+       <div class="quick-stats">
+           <div class="stat-card">
+               <div>Total GPOs</div>
+               <div class="stat-number">$($summaryStats.TotalGPOs)</div>
+           </div>
+           <div class="stat-card">
+               <div>High Impact GPOs</div>
+               <div class="stat-number">$($summaryStats.HighImpactGPOs)</div>
+           </div>
+           <div class="stat-card">
+               <div>High Complexity GPOs</div>
+               <div class="stat-number">$($summaryStats.HighComplexityGPOs)</div>
+           </div>
+           <div class="stat-card">
+               <div>Consolidation Candidates</div>
+               <div class="stat-number">$($summaryStats.ConsolidationCandidates)</div>
+           </div>
+           <div class="stat-card">
+               <div>Computer Settings GPOs</div>
+               <div class="stat-number">$($summaryStats.ComputerSettingsGPOs)</div>
+           </div>
+           <div class="stat-card">
+               <div>User Settings GPOs</div>
+               <div class="stat-number">$($summaryStats.UserSettingsGPOs)</div>
+           </div>
+           <div class="stat-card">
+               <div>Hybrid GPOs (Both)</div>
+               <div class="stat-number">$($summaryStats.BothSettingsGPOs)</div>
+           </div>
+           <div class="stat-card">
+               <div>Avg Settings Per GPO</div>
+               <div class="stat-number">$($summaryStats.AverageSettingsPerGPO)</div>
+           </div>
+       </div>
+       
+       <h3>GPO Distribution by Category</h3>
+       <table>
+           <tr>
+               <th>Category</th>
+               <th>Count</th>
+               <th>% of Total</th>
+               <th>High Impact</th>
+               <th>Consolidation Candidates</th>
+           </tr>
+"@
+
+   # Add category statistics
+   foreach ($category in ($report.Keys | Sort-Object { $report[$_].Count } -Descending)) {
+       $categoryGpos = $report[$category]
+       $highImpact = ($categoryGpos | Where-Object { $_.Impact -eq "High" }).Count
+       $consolidation = ($categoryGpos | Where-Object { $_.ConsolidationRecommendation }).Count
+       if ($summaryStats.TotalGPOs -gt 0) {
+           $percentage = [math]::Round(($categoryGpos.Count / $summaryStats.TotalGPOs) * 100, 1)
+       } else {
+           $percentage = 0
+       }
+       
+       $htmlReport += @"
+           <tr>
+               <td>$category</td>
+               <td>$($categoryGpos.Count)</td>
+               <td>$percentage%</td>
+               <td>$highImpact</td>
+               <td>$consolidation</td>
+           </tr>
+"@
+   }
+
+   $htmlReport += @"
+       </table>
+       
+       <h3>Environment Recommendations</h3>
+       <div class="recommendation">
+           <h4>General Recommendations</h4>
+           <ul>
+               <li><strong>GPO Organization:</strong> Consider reorganizing GPOs to follow a more structured naming convention and categorization.</li>
+               <li><strong>Consolidation:</strong> Review the $($summaryStats.ConsolidationCandidates) consolidation candidates identified in this report to simplify management.</li>
+               <li><strong>Documentation:</strong> Improve GPO descriptions to better document their purpose and settings.</li>
+               <li><strong>Testing:</strong> Implement a test environment to validate GPO changes before deployment.</li>
+           </ul>
+       </div>
+   </div>
+   
+   <div id="consolidation" class="tabcontent">
+       <h2>Consolidation Opportunities</h2>
+       
+       <div class="search-box">
+           <input type="text" id="gpo-filter" onkeyup="filterGPOs(this)" placeholder="Search for GPO names...">
+       </div>
+       
+       <table>
+           <tr>
+               <th>GPO Name</th>
+               <th>Category</th>
+               <th>Impact</th>
+               <th>Settings</th>
+               <th>Consolidation Recommendation</th>
+           </tr>
+"@
+
+   # Add consolidation candidates
+   $consolidationCandidates = $allGpos | Where-Object { $_.ConsolidationRecommendation } | Sort-Object -Property Name
+   
+   foreach ($gpo in $consolidationCandidates) {
+       $category = ($report.Keys | Where-Object { $report[$_] -contains $gpo })[0]
+       
+       $impactBadge = switch ($gpo.Impact) {
+           "High" { "<span class='badge badge-high'>High</span>" }
+           "Medium" { "<span class='badge badge-medium'>Medium</span>" }
+           "Low" { "<span class='badge badge-low'>Low</span>" }
+       }
+       
+       $htmlReport += @"
+           <tr>
+               <td>$($gpo.Name)</td>
+               <td>$category</td>
+               <td>$($gpo.Impact) $impactBadge</td>
+               <td>$($gpo.SettingCount)</td>
+               <td>$($gpo.ConsolidationRecommendation)</td>
+           </tr>
+"@
+   }
+
+   $htmlReport += @"
+       </table>
+       
+       <h3>Consolidation Guidelines</h3>
+       <div class="category-info">
+           <p>When consolidating GPOs, follow these best practices:</p>
+           <ul>
+               <li><strong>Test thoroughly:</strong> Always test consolidated GPOs in a non-production environment first.</li>
+               <li><strong>Document changes:</strong> Keep detailed documentation of what was consolidated and why.</li>
+               <li><strong>Maintain logical grouping:</strong> Combine GPOs with similar functions and purposes.</li>
+               <li><strong>Consider impact:</strong> Pay special attention when consolidating high-impact policies.</li>
+               <li><strong>Backup:</strong> Always backup GPOs before making any changes.</li>
+           </ul>
+       </div>
+   </div>
+   
+   <div id="categories" class="tabcontent">
+       <h2>GPO Categories</h2>
+"@
+
+   # Add category sections
+   foreach ($category in ($report.Keys | Sort-Object { $report[$_].Count } -Descending)) {
+       $categoryGpos = $report[$category]
+       
+       # Skip empty categories
+       if ($categoryGpos.Count -eq 0) {
+           continue
+       }
+       
+       # Add category description
+       $categoryDescription = switch ($category) {
+           "Security" { "Policies that enforce security settings, password requirements, audit settings, and other security-related configurations." }
+           "Network" { "Policies that configure network settings, firewall rules, VPN connections, and other network-related configurations." }
+           "Application" { "Policies that manage software deployment, application settings, and application-specific configurations." }
+           "Desktop" { "Policies that configure the desktop environment, start menu, taskbar, and other UI elements." }
+           "Printer" { "Policies that manage printer deployment and printer-related settings." }
+           "Device" { "Policies that control hardware devices, drivers, and peripherals." }
+           "Windows Update" { "Policies that configure Windows Update settings and software patching." }
+           "Folder Redirection" { "Policies that redirect user folders to network locations." }
+           "Scripts" { "Policies that deploy logon, logoff, startup, and shutdown scripts." }
+           "Administrative Templates" { "Policies that configure registry-based policy settings defined in Administrative Templates." }
+           "Compliance" { "Policies that enforce regulatory, industry, or organizational compliance requirements." }
+           "User Policies" { "Policies that primarily affect user settings and environment." }
+           "Computer Policies" { "Policies that primarily affect computer settings and configuration." }
+           "Other Policies" { "Miscellaneous policies that don't fit into other categories." }
+           default { "Policies related to $category configurations." }
+       }
+       
+       $htmlReport += @"
+       <h3>$category ($($categoryGpos.Count))</h3>
+       <div class="category-info">$categoryDescription</div>
+       
+       <div class="search-box">
+           <input type="text" class="gpo-filter" onkeyup="filterGPOs(this)" placeholder="Search for GPO names in this category...">
+       </div>
+       
+       <table>
+           <tr>
+               <th>Name</th>
+               <th>Impact</th>
+               <th>Complexity</th>
+               <th>Settings</th>
+               <th>Links</th>
+               <th>Consolidation</th>
+           </tr>
+"@
+
+       foreach ($gpo in ($categoryGpos | Sort-Object -Property Name)) {
+           $impactBadge = switch ($gpo.Impact) {
+               "High" { "<span class='badge badge-high'>High</span>" }
+               "Medium" { "<span class='badge badge-medium'>Medium</span>" }
+               "Low" { "<span class='badge badge-low'>Low</span>" }
+           }
+           
+           $complexityBadge = switch ($gpo.Complexity) {
+               "High" { "<span class='badge badge-high'>High</span>" }
+               "Medium" { "<span class='badge badge-medium'>Medium</span>" }
+               "Low" { "<span class='badge badge-low'>Low</span>" }
+           }
+           
+           $consolidation = if ($gpo.ConsolidationRecommendation) {
+               "<span title='$($gpo.ConsolidationRecommendation)'>Yes</span>"
+           } else {
+               "No"
+           }
+           
+           $htmlReport += @"
+           <tr>
+               <td>$($gpo.Name)</td>
+               <td>$($gpo.Impact) $impactBadge</td>
+               <td>$($gpo.Complexity) $complexityBadge</td>
+               <td>$($gpo.SettingCount)</td>
+               <td>$(($gpo.Links -join "<br>"))</td>
+               <td>$consolidation</td>
+           </tr>
+"@
+       }
+
+       $htmlReport += "</table>"
+   }
+
+   $htmlReport += @"
+   </div>
+   
+   <div id="links" class="tabcontent">
+       <h2>GPO Links by Location</h2>
+       <div class="search-box">
+           <input type="text" onkeyup="filterGPOs(this)" placeholder="Filter by OU path...">
+       </div>
+       <table>
+           <tr><th>Location (OU)</th><th>Linked GPOs</th></tr>
+           <!-- POWERSHELL_INSERT_LINKS -->
+       </table>
+   </div>
+   
+   <div id="details" class="tabcontent">
+       <h2>Detailed GPO Analysis</h2>
+       
+       <div class="search-box">
+           <input type="text" id="gpo-detail-filter" onkeyup="filterGPOs(this)" placeholder="Search for GPO names...">
+       </div>
+"@
+
+   # Add detailed GPO analysis
+   foreach ($gpo in ($allGpos | Sort-Object -Property Name)) {
+       $category = ($report.Keys | Where-Object { $report[$_] -contains $gpo })[0]
+       
+       $impactBadge = switch ($gpo.Impact) {
+           "High" { "<span class='badge badge-high'>High</span>" }
+           "Medium" { "<span class='badge badge-medium'>Medium</span>" }
+           "Low" { "<span class='badge badge-low'>Low</span>" }
+       }
+       
+       $complexityBadge = switch ($gpo.Complexity) {
+           "High" { "<span class='badge badge-high'>High</span>" }
+           "Medium" { "<span class='badge badge-medium'>Medium</span>" }
+           "Low" { "<span class='badge badge-low'>Low</span>" }
+       }
+       $unusedBadge = if ($gpo.Unused) { "<span class='badge badge-warning'>Unused</span>" } else { "" }
+       
+       # Summary of settings (previously $detailsHtml)
+       $summaryHtml = if ($gpo.Details -and $gpo.Details.Count -gt 0) {
+           "<ul class='details'>" + 
+           ($gpo.Details | ForEach-Object { "<li>$_</li>" } | Out-String) + 
+           "</ul>"
+       } else {
+           "<span class='details'>No detailed settings extracted</span>"
+       }
+
+       # Build in-depth settings description
+       $detailsHtml = "<div><h4>Detailed Policy Actions:</h4><ul class='details'>"
+       foreach ($settingType in $gpo.FullSettings.Keys | Sort-Object) {
+           foreach ($setting in $gpo.FullSettings[$settingType]) {
+               $detailsHtml += "<li><strong>$($settingType):</strong> $setting</li>"
+           }
+       }
+       $detailsHtml += "</ul></div>"
+       
+       $settingsHtml = "<ul class='details'>"
+       if ($gpo.ComputerSettingsEnabled) { $settingsHtml += "<li>Computer Settings Enabled</li>" }
+       if ($gpo.UserSettingsEnabled) { $settingsHtml += "<li>User Settings Enabled</li>" }
+       $settingsHtml += "</ul>"
+       
+       $linkHtml = if ($gpo.Links.Count -gt 0) {
+           "<ul class='details'>" + 
+           ($gpo.Links | ForEach-Object { "<li>$_</li>" } | Out-String) + 
+           "</ul>"
+       } else {
+           "<span class='details'>No links found</span>"
+       }
+       
+       # Create detailed settings sections
+       $fullSettingsHtml = ""
+       foreach ($settingType in $gpo.FullSettings.Keys | Sort-Object) {
+           $settings = $gpo.FullSettings[$settingType]
+           if ($settings.Count -gt 0) {
+               $fullSettingsHtml += "<details>"
+               $fullSettingsHtml += "<summary>$settingType ($($settings.Count) settings)</summary>"
+               $fullSettingsHtml += "<ul class='details'>"
+               foreach ($setting in $settings) {
+                   $fullSettingsHtml += "<li><strong>$($settingType):</strong> $setting</li>"
+               }
+               $fullSettingsHtml += "</ul>"
+               $fullSettingsHtml += "</details>"
+           }
+       }
+       
+       # Raw XML dump section (always included)
+       if ($gpo.FullSettings.ContainsKey("RawXml")) {
+           $htmlReport += '<div class="raw-xml"><h4>Raw XML Dump</h4><ul class="details">'
+           foreach ($entry in $gpo.FullSettings["RawXml"]) {
+               $htmlReport += "<li>$entry</li>"
+           }
+           $htmlReport += '</ul></div>'
+       }
+       
+       # Consolidation recommendations
+       $consolidationHtml = if ($gpo.ConsolidationRecommendation) {
+           "<div class='recommendation'><h4>Consolidation Recommendation</h4><p>$($gpo.ConsolidationRecommendation)</p></div>"
+       } else {
+           ""
+       }
+       
+       $htmlReport += @"
+       <details>
+           <summary>$($gpo.Name) ($category)</summary>
+           <div style="padding: 15px;">
+               <h3>$($gpo.Name) $unusedBadge</h3>
+               <p><strong>Description:</strong> $($gpo.Description)</p>
+               
+               <div style="display: flex; flex-wrap: wrap; margin-bottom: 15px;">
+                   <div style="flex: 1; min-width: 200px; margin-right: 20px;">
+                       <h4>Overview</h4>
+                       <ul>
+                           <li><strong>Category:</strong> $category</li>
+                           <li><strong>Impact:</strong> $($gpo.Impact) $impactBadge</li>
+                           <li><strong>Complexity:</strong> $($gpo.Complexity) $complexityBadge</li>
+                           <li><strong>Setting Count:</strong> $($gpo.SettingCount)</li>
+                           <li><strong>Created:</strong> $($gpo.CreatedDate)</li>
+                           <li><strong>Modified:</strong> $($gpo.ModifiedDate)</li>
+                           <li><strong>Created By:</strong> $($gpo.CreatedBy)</li>
+                       </ul>
+                   </div>
+                   
+                   <div style="flex: 1; min-width: 200px;">
+                       <h4>Policy Scope</h4>
+                       <div>$settingsHtml</div>
+                       
+                       <h4>Links</h4>
+                       <div>$linkHtml</div>
+                   </div>
+               </div>
+               
+               <h4>Summary of Settings</h4>
+               $summaryHtml
+
+               $detailsHtml
+
+               <h4>Detailed Settings</h4>
+               $fullSettingsHtml
+
+               $consolidationHtml
+           </div>
+       </details>
+"@
+   }
+
+   $htmlReport += @"
+   </div>
+   
+</div>
+   <script>
+       // Additional JavaScript can be added here if needed
+       function toggleVerbose(el) {
+         var raws = document.getElementsByClassName('raw-xml');
+         for (var i = 0; i < raws.length; i++) {
+           raws[i].style.display = el.checked ? 'block' : 'none';
+         }
+       }
+   </script>
+</body>
+</html>
+"@
+
+   # Insert the links table rows into the HTML report
+   $linksHtml = ""
+   foreach ($loc in $linksMap.Keys | Sort-Object) {
+       $gpoList = ($linksMap[$loc] | Sort-Object) -join ', '
+       $linksHtml += "<tr><td>$loc</td><td>$gpoList</td></tr>`n"
+   }
+   $htmlReport = $htmlReport -replace '<!-- POWERSHELL_INSERT_LINKS -->', [System.Text.RegularExpressions.Regex]::Escape($linksHtml) -replace '\\n', "`n" -replace '\\r', ""
+
+   # Save the HTML report
+   $reportPath = "GPO_Comprehensive_Analysis_Report.html"
+   $htmlReport | Out-File $reportPath -Encoding UTF8
+   
+   Write-Host "`nComprehensive report generated at: $((Get-Item $reportPath).FullName)"
+   
+   # Open the report in the default browser
+   Invoke-Item $reportPath
+}
+catch {
+   Write-Error "Error processing the XML file: $_"
+}

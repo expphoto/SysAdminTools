@@ -29,6 +29,12 @@
 .PARAMETER OutputFolder
     Custom output folder path (default: Desktop\OutlookAlertReports).
 
+.PARAMETER RulesPath
+    Optional path to a JSON rules file (OutlookAlertRules.json) defining use cases, owner mapping, and normalization settings.
+
+.PARAMETER CorrelationWindowMinutes
+    Minutes to cluster similar alerts into a single incident (default: 60).
+
 .EXAMPLE
     .\OutlookAlertReporter.ps1
     Run the script interactively with prompts for all options.
@@ -54,7 +60,9 @@ param(
     [string]$FilterType = "None",
     [string]$FilterAddress = "",
     [int]$DaysBack = 7,
-    [string]$OutputFolder = ""
+    [string]$OutputFolder = "",
+    [string]$RulesPath = "",
+    [int]$CorrelationWindowMinutes = 60
 )
 
 # Script-level variables and defaults
@@ -81,6 +89,14 @@ $script:ServerNameRegexes = @(
 $script:DuplicateBucketMinutes = 30
 $script:ComObjectsToCleanup = @()
 $script:SelectedFolderObject = $null
+$script:Rules = $null
+# Normalization defaults (can be overridden by rules file)
+$script:SignatureNormalization = @{
+    StripNumbersLongerThan = 4
+    StripGUIDs = $true
+    StripBrackets = $true
+    StripHexLike = $true
+}
 
 #region COM Object Management
 function Initialize-OutlookCom {
@@ -444,6 +460,8 @@ function Get-DefaultConfiguration {
         LowHangingFruitKeywords = $script:LowHangingFruitKeywords
         DuplicateBucketMinutes = $script:DuplicateBucketMinutes
         OutputFolder = $defaultOutputFolder
+        CorrelationWindowMinutes = $CorrelationWindowMinutes
+        RulesPath = $RulesPath
     }
     
     Write-Host "  Folder: $($config.Folder)" -ForegroundColor Gray
@@ -456,6 +474,148 @@ function Get-DefaultConfiguration {
 #endregion
 
 #region Email Processing Functions
+function Load-AlertRules {
+    param([hashtable]$Config)
+
+    $rulesFile = $Config.RulesPath
+    if ([string]::IsNullOrWhiteSpace($rulesFile)) {
+        $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+        $candidate1 = Join-Path $scriptDir 'OutlookAlertRules.json'
+        $candidate2 = Join-Path (Get-Location) 'OutlookAlertRules.json'
+        if (Test-Path $candidate1) { $rulesFile = $candidate1 }
+        elseif (Test-Path $candidate2) { $rulesFile = $candidate2 }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($rulesFile) -and (Test-Path $rulesFile)) {
+        try {
+            Write-Host "Loading alert rules from: $rulesFile" -ForegroundColor Green
+            $json = Get-Content -Raw -Path $rulesFile | ConvertFrom-Json
+            $script:Rules = $json
+            if ($json.normalization) {
+                if ($json.normalization.StripNumbersLongerThan) { $script:SignatureNormalization.StripNumbersLongerThan = [int]$json.normalization.StripNumbersLongerThan }
+                if ($null -ne $json.normalization.StripGUIDs) { $script:SignatureNormalization.StripGUIDs = [bool]$json.normalization.StripGUIDs }
+                if ($null -ne $json.normalization.StripBrackets) { $script:SignatureNormalization.StripBrackets = [bool]$json.normalization.StripBrackets }
+                if ($null -ne $json.normalization.StripHexLike) { $script:SignatureNormalization.StripHexLike = [bool]$json.normalization.StripHexLike }
+            }
+            if ($json.correlation -and $json.correlation.windowMinutes) {
+                $Config.CorrelationWindowMinutes = [int]$json.correlation.windowMinutes
+            }
+        }
+        catch {
+            Write-Warning "Failed to load rules file: $($_.Exception.Message)"
+            $script:Rules = $null
+        }
+    } else {
+        Write-Verbose "No rules file found. Proceeding with built-in keyword logic."
+    }
+}
+
+function Get-AlertSignature {
+    param([string]$Subject)
+
+    if ([string]::IsNullOrWhiteSpace($Subject)) { return "(no-subject)" }
+    $sig = $Subject.ToLower().Trim()
+    $sig = $sig -replace '^\s*(?:re:|fw:|fwd:)\s*', ''
+    if ($script:SignatureNormalization.StripGUIDs) {
+        $sig = $sig -replace '\b[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}\b', ''
+    }
+    if ($script:SignatureNormalization.StripHexLike) {
+        $sig = $sig -replace '\b0x[0-9a-f]+\b', '' -replace '\b[0-9a-f]{6,}\b', ''
+    }
+    if ($script:SignatureNormalization.StripBrackets) {
+        $sig = $sig -replace '[[({][^])}]{2,}[)\]]', ''
+    }
+    $n = [int]$script:SignatureNormalization.StripNumbersLongerThan
+    if ($n -ge 1) {
+        $sig = [regex]::Replace($sig, "\b\d{$n,}\b", '')
+    }
+    $sig = $sig -replace '\s+', ' '
+    return $sig.Trim()
+}
+
+function Apply-UseCaseRules {
+    param([object]$Email)
+    if (-not $script:Rules -or -not $script:Rules.useCases) { return $Email }
+
+    $from = ($Email.SenderEmailAddress.ToString().ToLower())
+    $subject = ($Email.Subject.ToString().ToLower())
+    $body = ($Email.Body.ToString().ToLower())
+
+    foreach ($rule in $script:Rules.useCases) {
+        $match = $true
+        if ($rule.match.from) {
+            $match = ($rule.match.from | ForEach-Object { $_.ToLower() } | Where-Object { $from -like $_ -or $from -eq $_ }).Count -gt 0
+        }
+        if ($match -and $rule.match.subjectIncludes) {
+            $match = ($rule.match.subjectIncludes | ForEach-Object { $_.ToLower() } | Where-Object { $subject -like "*$_*" }).Count -gt 0
+        }
+        if ($match -and $rule.match.subjectRegex) {
+            try { $match = [regex]::IsMatch($subject, [string]$rule.match.subjectRegex, 'IgnoreCase') } catch { $match = $false }
+        }
+        if ($match -and $rule.match.bodyIncludes) {
+            $match = ($rule.match.bodyIncludes | ForEach-Object { $_.ToLower() } | Where-Object { $body -like "*$_*" }).Count -gt 0
+        }
+        if ($match) {
+            $Email.UseCase = $rule.name
+            if ($rule.category) { $Email.Category = $rule.category }
+            if ($rule.vendor) { $Email.Vendor = $rule.vendor }
+            if ($rule.priority -and $rule.priority -match '(?i)high') { $Email.HighPriority = $true }
+            if ($rule.priority -and $rule.priority -match '(?i)low') { $Email.LowHangingFruit = $true }
+            if ($rule.keywordsHigh) {
+                $Email.HighPriority = $Email.HighPriority -or (Test-KeywordMatch -Text "$($Email.Subject) $($Email.Body)" -Keywords $rule.keywordsHigh)
+            }
+            break
+        }
+    }
+    return $Email
+}
+
+function Determine-Owner {
+    param([object]$Email)
+
+    # 1) Rules file ownerRules take precedence
+    try {
+        if ($script:Rules -and $script:Rules.ownerRules) {
+            $from = ($Email.SenderEmailAddress.ToString().ToLower())
+            $subject = ($Email.Subject.ToString().ToLower())
+            $body = ($Email.Body.ToString().ToLower())
+            $useCase = ($Email.UseCase.ToString().ToLower())
+            $server = ($Email.ServerName.ToString().ToLower())
+            foreach ($r in $script:Rules.ownerRules) {
+                $m = $true
+                if ($r.match.from) { $m = $m -and (($r.match.from | ForEach-Object { $_.ToLower() }) -contains $from -or ($r.match.from | ForEach-Object { $_.ToLower() } | Where-Object { $from -like $_ }).Count -gt 0) }
+                if ($m -and $r.match.subjectIncludes) { $m = ($r.match.subjectIncludes | ForEach-Object { $_.ToLower() } | Where-Object { $subject -like "*$_*" }).Count -gt 0 }
+                if ($m -and $r.match.subjectRegex) { try { $m = [regex]::IsMatch($subject, [string]$r.match.subjectRegex, 'IgnoreCase') } catch { $m = $false } }
+                if ($m -and $r.match.bodyIncludes) { $m = ($r.match.bodyIncludes | ForEach-Object { $_.ToLower() } | Where-Object { $body -like "*$_*" }).Count -gt 0 }
+                if ($m -and $r.match.useCaseIncludes) { $m = ($r.match.useCaseIncludes | ForEach-Object { $_.ToLower() } | Where-Object { $useCase -like "*$_*" }).Count -gt 0 }
+                if ($m -and $r.match.serverRegex) { try { $m = [regex]::IsMatch($server, [string]$r.match.serverRegex, 'IgnoreCase') } catch { $m = $false } }
+                if ($m -and $r.owner) { return ([string]$r.owner) }
+            }
+        }
+    } catch { }
+
+    # 2) Heuristics by keywords
+    $text = ("$($Email.Subject) $($Email.Body) $($Email.UseCase)".ToLower())
+    $isNetworking = $text -match '(\bfirewall\b|\brouter\b|\bswitch\b|\bbgp\b|\bdns\b|\bdhcp\b|\bvpn\b|packet loss|latency|link down)'
+    if ($isNetworking -or $Email.ServerName -match '^(sw|rt|fw|vpn|edge)') { return 'Networking' }
+
+    $isDevelopment = $text -match '(jenkins|gitlab|github actions|build failed|pipeline|deploy|compile|unit test|lint|merge|commit)'
+    if ($isDevelopment) { return 'Development' }
+
+    $isEngineering = $text -match '(database|sql|query|index|deadlock|exception|stack trace|api|service|microservice|kafka|rabbitmq|redis|cache|oom|memory leak)'
+    if ($isEngineering) { return 'Engineering' }
+
+    $isAdmins = $text -match '(disk|cpu|memory|filesystem|backup|antivirus|patch|windows|linux|service stopped|hyper-v|vmware|cluster|logon|gpo)'
+    if ($isAdmins) { return 'Admins' }
+
+    # 3) Sender/domain hints
+    $fromLower = ($Email.SenderEmailAddress.ToString().ToLower())
+    if ($fromLower -match '(jenkins|gitlab|github)') { return 'Development' }
+    if ($fromLower -match '(zabbix|nagios|solarwinds|prtg)') { return 'Admins' }
+    if ($fromLower -match '(newrelic|datadog|dynatrace|appdynamics)') { return 'Engineering' }
+
+    return 'Other'
+}
 function Get-EmailData {
     param(
         [hashtable]$Config,
@@ -895,6 +1055,7 @@ function Extract-EmailInfo {
             To = Get-RecipientsString -Item $Item
             Subject = if ($Item.Subject) { $Item.Subject } else { "(No Subject)" }
             NormalizedSubject = Get-NormalizedSubject -Subject $(if ($Item.Subject) { $Item.Subject } else { "" })
+            Signature = $null
             Body = Get-EmailBodyPreview -Item $Item
             EntryID = if ($Item.EntryID) { $Item.EntryID } else { "" }
             FolderPath = $FolderPath
@@ -904,6 +1065,9 @@ function Extract-EmailInfo {
             LowHangingFruit = $false
             IsDuplicate = $false
             DuplicateGroupId = ""
+            UseCase = ""
+            Category = ""
+            Vendor = ""
         }
         
         # Get Internet Message ID via PropertyAccessor
@@ -919,6 +1083,9 @@ function Extract-EmailInfo {
         
         # Extract server name from subject and body
         $emailInfo.ServerName = Extract-ServerName -Subject $Item.Subject -Body $emailInfo.Body
+
+        # Build normalized signature for correlation
+        $emailInfo.Signature = Get-AlertSignature -Subject $emailInfo.NormalizedSubject
         
         return $emailInfo
     }
@@ -1098,6 +1265,15 @@ function Process-EmailData {
         $email.IsDuplicate = $false
         $email.DuplicateGroupId = ""
         
+        # Apply rule-based classification if available
+        $null = Apply-UseCaseRules -Email $email
+        
+        # Determine owner/team (Development, Engineering, Admins, Networking, Other)
+        $email.OwnerTeam = Determine-Owner -Email $email
+
+        # Apply rule-based classification if rules are loaded
+        $null = Apply-UseCaseRules -Email $email
+        
         if ($keywordDebugMode) {
             Write-Host "  High Priority: $($email.HighPriority)" -ForegroundColor $(if ($email.HighPriority) { "Red" } else { "Gray" })
             Write-Host "  Low-Hanging Fruit: $($email.LowHangingFruit)" -ForegroundColor $(if ($email.LowHangingFruit) { "Green" } else { "Gray" })
@@ -1133,11 +1309,15 @@ function Process-EmailData {
     $uniqueCount = $EmailData.Count - $duplicateCount
     Write-Verbose "Found $uniqueCount unique emails and $duplicateCount duplicates"
     
+    # Correlate alerts into incidents (use signature/use case/server + time window)
+    $incidents = Invoke-Correlation -Emails ($EmailData | Sort-Object ReceivedTime) -WindowMinutes $Config.CorrelationWindowMinutes
+
     return @{
         AllEmails = $EmailData
         UniqueEmails = $EmailData | Where-Object { -not $_.IsDuplicate }
         DuplicateEmails = $EmailData | Where-Object { $_.IsDuplicate }
         DuplicateGroups = $duplicateGroups
+        Incidents = $incidents
     }
 }
 
@@ -1191,6 +1371,77 @@ function Get-DuplicateKey {
     
     return $fallbackKey
 }
+
+function Invoke-Correlation {
+    param(
+        [array]$Emails,
+        [int]$WindowMinutes = 60
+    )
+
+    if (-not $Emails -or $Emails.Count -eq 0) { return @() }
+
+    $groups = @{}
+    $incidents = @()
+
+    foreach ($email in $Emails) {
+        $useCase = if ($email.UseCase) { $email.UseCase } else { 'General' }
+        $server = if ($email.ServerName) { $email.ServerName } else { 'Unknown' }
+        $signature = if ($email.Signature) { $email.Signature } else { $email.NormalizedSubject }
+        $baseKey = "$useCase|$server|$signature"
+
+        if (-not $groups.ContainsKey($baseKey)) { $groups[$baseKey] = @() }
+        $groups[$baseKey] += $email
+    }
+
+    foreach ($kv in $groups.GetEnumerator()) {
+        $sorted = $kv.Value | Sort-Object ReceivedTime
+        $current = $null
+        foreach ($e in $sorted) {
+            if (-not $current) {
+                $current = [PSCustomObject]@{
+                    IncidentId = [guid]::NewGuid().ToString()
+                    UseCase = if ($e.UseCase) { $e.UseCase } else { 'General' }
+                    ServerName = if ($e.ServerName) { $e.ServerName } else { 'Unknown' }
+                    Signature = if ($e.Signature) { $e.Signature } else { $e.NormalizedSubject }
+                    FirstSeen = $e.ReceivedTime
+                    LastSeen = $e.ReceivedTime
+                    Count = 1
+                    HighPriority = [bool]$e.HighPriority
+                    LowHangingFruit = [bool]$e.LowHangingFruit
+                    SampleSubject = $e.Subject
+                    OwnerTeam = if ($e.OwnerTeam) { $e.OwnerTeam } else { 'Other' }
+                }
+                continue
+            }
+
+            $span = [timespan]::FromMinutes($WindowMinutes)
+            if ($e.ReceivedTime -le $current.LastSeen.Add($span)) {
+                $current.LastSeen = $e.ReceivedTime
+                $current.Count += 1
+                $current.HighPriority = $current.HighPriority -or $e.HighPriority
+                $current.LowHangingFruit = $current.LowHangingFruit -or $e.LowHangingFruit
+            } else {
+                $incidents += $current
+                $current = [PSCustomObject]@{
+                    IncidentId = [guid]::NewGuid().ToString()
+                    UseCase = if ($e.UseCase) { $e.UseCase } else { 'General' }
+                    ServerName = if ($e.ServerName) { $e.ServerName } else { 'Unknown' }
+                    Signature = if ($e.Signature) { $e.Signature } else { $e.NormalizedSubject }
+                    FirstSeen = $e.ReceivedTime
+                    LastSeen = $e.ReceivedTime
+                    Count = 1
+                    HighPriority = [bool]$e.HighPriority
+                    LowHangingFruit = [bool]$e.LowHangingFruit
+                    SampleSubject = $e.Subject
+                    OwnerTeam = if ($e.OwnerTeam) { $e.OwnerTeam } else { 'Other' }
+                }
+            }
+        }
+        if ($current) { $incidents += $current }
+    }
+
+    return ($incidents | Sort-Object LastSeen -Descending)
+}
 #endregion
 
 #region Reporting Functions
@@ -1225,6 +1476,7 @@ function Show-ConsoleSummary {
     $allEmails = $ProcessedData.AllEmails
     $uniqueEmails = $ProcessedData.UniqueEmails
     $duplicateEmails = $ProcessedData.DuplicateEmails
+    $incidents = $ProcessedData.Incidents
     
     Write-Host ""
     Write-Host "=== OUTLOOK ALERT ANALYSIS SUMMARY ===" -ForegroundColor Cyan
@@ -1289,6 +1541,30 @@ function Show-ConsoleSummary {
         Write-Host "  $($server.Count)x - $displayName"
     }
     
+    # Owners distribution
+    Write-Host ""
+    Write-Host "Owners (who should handle):" -ForegroundColor Yellow
+    $owners = $allEmails | Group-Object { if ($_.OwnerTeam) { $_.OwnerTeam } else { 'Other' } } | Sort-Object Count -Descending
+    foreach ($o in $owners) { Write-Host "  $($o.Count)x - $($o.Name)" }
+    
+    # Top Use Cases
+    Write-Host ""
+    Write-Host "Top Use Cases:" -ForegroundColor Yellow
+    $useCases = $allEmails | Group-Object { if ($_.UseCase) { $_.UseCase } else { 'General' } } | Sort-Object Count -Descending | Select-Object -First 10
+    foreach ($uc in $useCases) {
+        Write-Host "  $($uc.Count)x - $($uc.Name)"
+    }
+    
+    # Correlated incidents
+    if ($ProcessedData.Incidents -and $ProcessedData.Incidents.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Correlated Incidents (window: $($Config.CorrelationWindowMinutes) min):" -ForegroundColor Yellow
+        foreach ($inc in ($ProcessedData.Incidents | Select-Object -First 10)) {
+            $p = if ($inc.HighPriority) { 'HIGH' } elseif ($inc.LowHangingFruit) { 'LOW' } else { 'Other' }
+            Write-Host "  [$($inc.FirstSeen.ToString('MM-dd HH:mm')) → $($inc.LastSeen.ToString('MM-dd HH:mm'))] $($inc.UseCase) | $($inc.ServerName) | $($inc.Signature) | x$($inc.Count) | $p"
+        }
+    }
+    
     # Alerts per day
     Write-Host ""
     Write-Host "Alerts per Day:" -ForegroundColor Yellow
@@ -1326,10 +1602,30 @@ function Export-CsvReports {
     $allCsvPath = Join-Path $Config.OutputFolder "alerts_all.csv"
     $uniqueCsvPath = Join-Path $Config.OutputFolder "alerts_unique.csv"
     $duplicatesCsvPath = Join-Path $Config.OutputFolder "alerts_duplicates.csv"
+    $incidentsCsvPath = Join-Path $Config.OutputFolder "alerts_incidents.csv"
     
-    $csvAllEmails | Export-Csv -Path $allCsvPath -NoTypeInformation -Encoding UTF8
-    $csvUniqueEmails | Export-Csv -Path $uniqueCsvPath -NoTypeInformation -Encoding UTF8
-    $csvDuplicateEmails | Export-Csv -Path $duplicatesCsvPath -NoTypeInformation -Encoding UTF8
+            $csvAllEmails | Export-Csv -Path $allCsvPath -NoTypeInformation -Encoding UTF8
+            $csvUniqueEmails | Export-Csv -Path $uniqueCsvPath -NoTypeInformation -Encoding UTF8
+            $csvDuplicateEmails | Export-Csv -Path $duplicatesCsvPath -NoTypeInformation -Encoding UTF8
+    
+    # Incidents CSV
+    $incidentRows = $ProcessedData.Incidents | ForEach-Object {
+        [PSCustomObject]@{
+            IncidentId = $_.IncidentId
+            UseCase = $_.UseCase
+            ServerName = $_.ServerName
+            Signature = $_.Signature
+            FirstSeen = $_.FirstSeen.ToString('yyyy-MM-dd HH:mm:ss')
+            LastSeen = $_.LastSeen.ToString('yyyy-MM-dd HH:mm:ss')
+            Count = $_.Count
+            Priority = if ($_.HighPriority) { 'High' } elseif ($_.LowHangingFruit) { 'Low' } else { 'Other' }
+            OwnerTeam = $_.OwnerTeam
+            SampleSubject = $_.SampleSubject
+        }
+    }
+    if ($incidentRows) {
+        $incidentRows | Export-Csv -Path $incidentsCsvPath -NoTypeInformation -Encoding UTF8
+    }
     
     $allCount = $csvAllEmails.Count
     $uniqueCount = $csvUniqueEmails.Count 
@@ -1338,6 +1634,7 @@ function Export-CsvReports {
     Write-Host "  Exported: alerts_all.csv - $allCount rows" -ForegroundColor Green
     Write-Host "  Exported: alerts_unique.csv - $uniqueCount rows" -ForegroundColor Green
     Write-Host "  Exported: alerts_duplicates.csv - $duplicateCount rows" -ForegroundColor Green
+    Write-Host "  Exported: alerts_incidents.csv - $($incidentRows.Count) rows" -ForegroundColor Green
 }
 
 function Convert-EmailsForCsv {
@@ -1355,11 +1652,16 @@ function Convert-EmailsForCsv {
                 To = if ($_.To) { $_.To } else { "" }
                 Subject = if ($_.Subject) { $_.Subject } else { "" }
                 NormalizedSubject = if ($_.NormalizedSubject) { $_.NormalizedSubject } else { "" }
+                Signature = if ($_.Signature) { $_.Signature } else { "" }
                 ServerName = if ($_.ServerName) { $_.ServerName } else { "" }
                 HighPriority = if ($_.HighPriority -ne $null) { $_.HighPriority } else { $false }
                 LowHangingFruit = if ($_.LowHangingFruit -ne $null) { $_.LowHangingFruit } else { $false }
                 IsDuplicate = if ($_.IsDuplicate -ne $null) { $_.IsDuplicate } else { $false }
                 DuplicateGroupId = if ($_.DuplicateGroupId) { $_.DuplicateGroupId } else { "" }
+                UseCase = if ($_.UseCase) { $_.UseCase } else { "" }
+                Category = if ($_.Category) { $_.Category } else { "" }
+                Vendor = if ($_.Vendor) { $_.Vendor } else { "" }
+                OwnerTeam = if ($_.OwnerTeam) { $_.OwnerTeam } else { "Other" }
                 EntryID = if ($_.EntryID) { $_.EntryID } else { "" }
                 InternetMessageId = if ($_.InternetMessageId) { $_.InternetMessageId } else { "" }
                 FolderPath = if ($_.FolderPath) { $_.FolderPath } else { "" }
@@ -1449,6 +1751,7 @@ function Export-HtmlReport {
                 <div class="stat-card"><div class="stat-number">$($uniqueEmails.Count)</div><div class="stat-label">Unique Alerts</div></div>
                 <div class="stat-card"><div class="stat-number">$($duplicateEmails.Count)</div><div class="stat-label">Duplicates</div></div>
                 <div class="stat-card"><div class="stat-number">$duplicateRatio%</div><div class="stat-label">Duplicate Ratio</div></div>
+                <div class="stat-card"><div class="stat-number">$($incidents.Count)</div><div class="stat-label">Correlated Incidents</div></div>
             </div>
         </div>
         
@@ -1542,7 +1845,42 @@ function Export-HtmlReport {
                 </tbody>
             </table>
         </div>
-        
+"@
+
+    # Owners and correlated incidents sections
+    $html += @"
+        <div class="section">
+            <h2>Top Owners</h2>
+            <div class="top-list">
+"@
+    $owners = $allEmails | Group-Object { if ($_.OwnerTeam) { $_.OwnerTeam } else { 'Other' } } | Sort-Object Count -Descending
+    foreach ($o in $owners) {
+        $safeOwner = $o.Name -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;'
+        $html += "<div class=""top-item""><span>$safeOwner</span><span class=""count-badge"">$($o.Count)</span></div>"
+    }
+    $html += @"
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Correlated Incidents (window: $($Config.CorrelationWindowMinutes) min)</h2>
+            <table>
+                <thead><tr><th>Use Case</th><th>Server</th><th>Signature</th><th>Owner</th><th>First Seen</th><th>Last Seen</th><th>Count</th><th>Priority</th></tr></thead>
+                <tbody>
+"@
+    foreach ($inc in ($incidents | Select-Object -First 50)) {
+        $priorityBadge = if ($inc.HighPriority) { 'High' } elseif ($inc.LowHangingFruit) { 'Low' } else { 'Other' }
+        $safeUse = $inc.UseCase -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;'
+        $safeSrv = $inc.ServerName -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;'
+        $safeSig = $inc.Signature -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;'
+        $safeOwner = $inc.OwnerTeam -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;'
+        $html += "<tr><td>$safeUse</td><td>$safeSrv</td><td>$safeSig</td><td>$safeOwner</td><td>$($inc.FirstSeen.ToString('yyyy-MM-dd HH:mm'))</td><td>$($inc.LastSeen.ToString('yyyy-MM-dd HH:mm'))</td><td>$($inc.Count)</td><td>$priorityBadge</td></tr>"
+    }
+    $html += @"
+                </tbody>
+            </table>
+        </div>
+
         <div class="footer">
             <p>Report generated by PowerShell Outlook Alert Reporter</p>
             <p>High Priority Keywords: $($Config.HighPriorityKeywords -join ', ')</p>
@@ -1630,6 +1968,9 @@ try {
     Write-Host ""
     Write-Host "Configuration complete. Starting analysis..." -ForegroundColor Green
     
+    # Load optional alert rules file
+    Load-AlertRules -Config $config
+
     # Initialize Outlook and analyze emails
     $comApp = Initialize-OutlookCom
     if (-not $comApp) {
