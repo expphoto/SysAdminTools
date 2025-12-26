@@ -4,7 +4,7 @@
     Interactive PowerShell script to analyze alert emails in Outlook and generate comprehensive reports.
 
 .DESCRIPTION
-    This script connects to Outlook via COM, analyzes alert emails based on user-defined criteria,
+    This script connects to Outlook via COM, analyzes alert emails based on user-defined criteria,sky
     and generates console summaries, CSV exports, and HTML reports. It supports duplicate detection,
     priority classification, and server name extraction.
 
@@ -67,12 +67,46 @@ param(
 
 # Script-level variables and defaults
 $script:HighPriorityKeywords = @(
+    # Infrastructure/System Issues
     'down','outage','critical','fail','failure','unreachable','offline','data loss',
-    'disk full','rto','rpo','panic','sev1','p1','escalation','security','ransom','malware'
+    'disk full','rto','rpo','panic','sev1','p1','escalation','emergency','crash',
+    
+    # Security & Compliance
+    'security','ransom','malware','virus','breach','attack','intrusion','hack','unauthorized',
+    'compliance','violation','gdpr','hipaa','pci','audit','legal','lawsuit','investigation',
+    
+    # Business Critical
+    'financial','revenue','billing','payment','transaction','customer impact','sla breach',
+    'business continuity','service level','availability','downtime','performance degradation',
+    
+    # Data & Database
+    'corruption','inconsistent','rollback','deadlock','timeout','connection lost','backup failed',
+    'restore failed','replication lag','sync error','migration failed',
+    
+    # High Severity Indicators
+    'urgent','immediate attention','asap','escalated','executive','board','stakeholder',
+    'multiple sites','wide area','global','regional','cluster','cascade'
 )
 
 $script:LowHangingFruitKeywords = @(
-    'auto-resolved','cleared','restarted','resolved','recovered','informational','success','ok'
+    # Resolution Indicators
+    'auto-resolved','cleared','restarted','resolved','recovered','fixed','repaired','restored',
+    'back online','service restored','connection restored','normalized','stable',
+    
+    # Informational Updates
+    'informational','success','ok','normal','operational','healthy','active','running',
+    'maintenance complete','deployed successfully','update applied','patch installed',
+    
+    # Routine Operations
+    'scheduled','planned','routine','regular','periodic','daily','weekly','monthly',
+    'test','drill','simulation','exercise','practice','demo','staging',
+    
+    # Low Priority Indicators
+    'warning','notice','advisory','FYI','for your information','FYA','for your action',
+    'low priority','minor','cosmetic','typo','documentation','update required',
+    
+    # Positive Status
+    'improved','optimized','enhanced','upgraded','performance improved','faster','efficient'
 )
 
 $script:ServerNameRegexes = @(
@@ -474,12 +508,31 @@ function Get-DefaultConfiguration {
 #endregion
 
 #region Email Processing Functions
+function Get-ScriptDirectory {
+    # Robust function to get script directory in all execution contexts
+    # Try multiple methods in order of reliability
+    if ($PSScriptRoot) {
+        return $PSScriptRoot
+    }
+    
+    if ($MyInvocation.MyCommand.Path) {
+        return Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+    
+    if ($PSCommandPath) {
+        return Split-Path -Parent $PSCommandPath
+    }
+    
+    # Final fallback to current directory
+    return Get-Location
+}
+
 function Load-AlertRules {
     param([hashtable]$Config)
 
     $rulesFile = $Config.RulesPath
     if ([string]::IsNullOrWhiteSpace($rulesFile)) {
-        $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+        $scriptDir = Get-ScriptDirectory
         $candidate1 = Join-Path $scriptDir 'OutlookAlertRules.json'
         $candidate2 = Join-Path (Get-Location) 'OutlookAlertRules.json'
         if (Test-Path $candidate1) { $rulesFile = $candidate1 }
@@ -1068,6 +1121,7 @@ function Extract-EmailInfo {
             UseCase = ""
             Category = ""
             Vendor = ""
+            OwnerTeam = "Other"
         }
         
         # Get Internet Message ID via PropertyAccessor
@@ -1723,11 +1777,30 @@ function Export-HtmlReport {
         tr:nth-child(even) { background-color: #f9f9f9; }
         tr:hover { background-color: #f5f5f5; }
         .top-list { background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin-top: 10px; }
-        .top-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e9ecef; }
+        .top-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e9ecef; cursor: pointer; transition: background-color 0.2s; }
         .top-item:last-child { border-bottom: none; }
-        .count-badge { background-color: #3498db; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.9em; font-weight: bold; }
+        .top-item:hover { background-color: #e9ecef; }
+        .count-badge { background-color: #3498db; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.9em; font-weight: bold; cursor: pointer; transition: background-color 0.2s; }
+        .count-badge:hover { background-color: #2980b9; }
+        .expandable-details { display: none; margin-top: 10px; margin-left: 20px; padding: 15px; background-color: #f8f9fa; border-radius: 5px; border-left: 3px solid #3498db; }
+        .expandable-details table { margin-top: 10px; }
+        .expandable-details td { font-size: 0.9em; }
+        .expand-icon { margin-right: 8px; transition: transform 0.2s; }
+        .expanded .expand-icon { transform: rotate(90deg); }
         .footer { margin-top: 30px; text-align: center; color: #7f8c8d; font-size: 0.9em; border-top: 1px solid #ddd; padding-top: 15px; }
     </style>
+    <script>
+        function toggleSection(sectionId) {
+            const section = document.getElementById(sectionId);
+            if (section) {
+                section.style.display = section.style.display === 'none' ? 'block' : 'none';
+                const icon = section.previousElementSibling;
+                if (icon) {
+                    icon.classList.toggle('expanded');
+                }
+            }
+        }
+    </script>
 </head>
 <body>
     <div class="container">
@@ -1769,11 +1842,32 @@ function Export-HtmlReport {
             <div class="top-list">
 "@
 
-    # Add top subjects
+    # Add top subjects with expandable details
     $topSubjects = $allEmails | Group-Object NormalizedSubject | Sort-Object Count -Descending | Select-Object -First 10
+    $subjectIndex = 0
     foreach ($subject in $topSubjects) {
-        $safeSubjectName = if ($subject.Name) { $subject.Name -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;' } else { "(No Subject)" }
-        $html += "<div class=""top-item""><span>$safeSubjectName</span><span class=""count-badge"">$($subject.Count)</span></div>"
+        $subjectIndex++
+        $safeSubjectName = if ($subject.Name) { $subject.Name -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&' } else { "(No Subject)" }
+        $subjectEmails = $allEmails | Where-Object { $_.NormalizedSubject -eq $subject.Name } | Sort-Object ReceivedTime -Descending
+        
+        $html += "<div class=""top-item"" onclick=""toggleSection('subject-$subjectIndex')""><span class=""expand-icon"">▶</span><span>$safeSubjectName</span><span class=""count-badge"">$($subject.Count)</span></div>"
+        $html += "<div id=""subject-$subjectIndex"" class=""expandable-details"">"
+        $html += "<h4>Recent emails with this subject:</h4>"
+        $html += "<table><thead><tr><th>Time</th><th>Sender</th><th>Priority</th><th>Owner</th></tr></thead><tbody>"
+        
+        foreach ($email in $subjectEmails | Select-Object -First 5) {
+            $priority = if ($email.HighPriority) { "High" } elseif ($email.LowHangingFruit) { "Low" } else { "Other" }
+            $timeStr = $email.ReceivedTime.ToString('yyyy-MM-dd HH:mm')
+            $safeSender = if ($email.SenderEmailAddress) { $email.SenderEmailAddress -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&' } else { "Unknown" }
+            $safeOwner = if ($email.OwnerTeam) { $email.OwnerTeam -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&' } else { "Other" }
+            $html += "<tr><td>$timeStr</td><td>$safeSender</td><td>$priority</td><td>$safeOwner</td></tr>"
+        }
+        
+        if ($subjectEmails.Count -gt 5) {
+            $html += "<tr><td colspan=""4""><em>... and $($subjectEmails.Count - 5) more emails</em></td></tr>"
+        }
+        
+        $html += "</tbody></table></div>"
     }
 
     $html += @"
@@ -1785,11 +1879,33 @@ function Export-HtmlReport {
             <div class="top-list">
 "@
 
-    # Add top servers
+    # Add top servers with expandable details
     $topServers = $allEmails | Group-Object ServerName | Sort-Object Count -Descending | Select-Object -First 10
+    $serverIndex = 0
     foreach ($server in $topServers) {
-        $safeServerName = if ($server.Name) { $server.Name -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;' } else { "Unknown" }
-        $html += "<div class=""top-item""><span>$safeServerName</span><span class=""count-badge"">$($server.Count)</span></div>"
+        $serverIndex++
+        $safeServerName = if ($server.Name) { $server.Name -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&' } else { "Unknown" }
+        $serverEmails = $allEmails | Where-Object { $_.ServerName -eq $server.Name } | Sort-Object ReceivedTime -Descending
+        
+        $html += "<div class=""top-item"" onclick=""toggleSection('server-$serverIndex')""><span class=""expand-icon"">▶</span><span>$safeServerName</span><span class=""count-badge"">$($server.Count)</span></div>"
+        $html += "<div id=""server-$serverIndex"" class=""expandable-details"">"
+        $html += "<h4>Recent alerts for this server:</h4>"
+        $html += "<table><thead><tr><th>Time</th><th>Subject</th><th>Priority</th><th>Owner</th></tr></thead><tbody>"
+        
+        foreach ($email in $serverEmails | Select-Object -First 5) {
+            $priority = if ($email.HighPriority) { "High" } elseif ($email.LowHangingFruit) { "Low" } else { "Other" }
+            $timeStr = $email.ReceivedTime.ToString('yyyy-MM-dd HH:mm')
+            $safeSubject = if ($email.Subject) { $email.Subject -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&' }
+            if ($email.Subject.Length -gt 100) { $safeSubject = $safeSubject.Substring(0, 100) + "..." }
+            $safeOwner = if ($email.OwnerTeam) { $email.OwnerTeam -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&' } else { "Other" }
+            $html += "<tr><td>$timeStr</td><td>$safeSubject</td><td>$priority</td><td>$safeOwner</td></tr>"
+        }
+        
+        if ($serverEmails.Count -gt 5) {
+            $html += "<tr><td colspan=""4""><em>... and $($serverEmails.Count - 5) more alerts</em></td></tr>"
+        }
+        
+        $html += "</tbody></table></div>"
     }
 
     $html += @"
@@ -1847,16 +1963,41 @@ function Export-HtmlReport {
         </div>
 "@
 
+    # Calculate owners distribution for HTML report
+    $owners = $allEmails | Group-Object { if ($_.OwnerTeam) { $_.OwnerTeam } else { 'Other' } } | Sort-Object Count -Descending
+
     # Owners and correlated incidents sections
     $html += @"
         <div class="section">
             <h2>Top Owners</h2>
             <div class="top-list">
 "@
-    $owners = $allEmails | Group-Object { if ($_.OwnerTeam) { $_.OwnerTeam } else { 'Other' } } | Sort-Object Count -Descending
+    $ownerIndex = 0
     foreach ($o in $owners) {
-        $safeOwner = $o.Name -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace '&', '&amp;'
-        $html += "<div class=""top-item""><span>$safeOwner</span><span class=""count-badge"">$($o.Count)</span></div>"
+        $ownerIndex++
+        $safeOwner = $o.Name -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&'
+        $ownerEmails = $allEmails | Where-Object { $_.OwnerTeam -eq $o.Name } | Sort-Object ReceivedTime -Descending
+        
+        $html += "<div class=""top-item"" onclick=""toggleSection('owner-$ownerIndex')""><span class=""expand-icon"">▶</span><span>$safeOwner</span><span class=""count-badge"">$($o.Count)</span></div>"
+        $html += "<div id=""owner-$ownerIndex"" class=""expandable-details"">"
+        $html += "<h4>Alerts assigned to this owner:</h4>"
+        $html += "<table><thead><tr><th>Time</th><th>Subject</th><th>Sender</th><th>Priority</th><th>Server</th></tr></thead><tbody>"
+        
+        foreach ($email in $ownerEmails | Select-Object -First 5) {
+            $priority = if ($email.HighPriority) { "High" } elseif ($email.LowHangingFruit) { "Low" } else { "Other" }
+            $timeStr = $email.ReceivedTime.ToString('yyyy-MM-dd HH:mm')
+            $safeSubject = if ($email.Subject) { $email.Subject -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&' } else { "(No Subject)" }
+            $safeServer = if ($email.ServerName) { $email.ServerName -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&' } else { "Unknown" }
+            $safeSender = if ($email.SenderEmailAddress) { $email.SenderEmailAddress -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&' } else { "Unknown" }
+            
+            $html += "<tr><td>$timeStr</td><td>$safeSubject</td><td>$safeSender</td><td>$priority</td><td>$safeServer</td></tr>"
+        }
+        
+        if ($ownerEmails.Count -gt 5) {
+            $html += "<tr><td colspan=""5""><em>... and $($ownerEmails.Count - 5) more alerts</em></td></tr>"
+        }
+        
+        $html += "</tbody></table></div>"
     }
     $html += @"
             </div>

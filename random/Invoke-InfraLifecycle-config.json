@@ -1,0 +1,42 @@
+{
+  "NimbleServer": "nimble-array.domain.local",
+  "vCenterServer": "vcenter.domain.local",
+  "DefaultPerformancePolicy": "VMware ESXi",
+  "DefaultMaxSnapshotAgeDays": 30,
+  "Clusters": {
+    "Prod-SQL-Cluster": {
+      "DatastoreCluster": "SQL-Storage",
+      "InitiatorGroupPattern": "ESXi-SQL-Cluster",
+      "PerformancePolicy": "SQL-Gold"
+    },
+    "Prod-Web-Cluster": {
+      "DatastoreCluster": "Web-Storage",
+      "InitiatorGroupPattern": "ESXi-Web-Cluster",
+      "PerformancePolicy": "VMware ESXi"
+    },
+    "Dev-Cluster": {
+      "DatastoreCluster": "Dev-Storage",
+      "InitiatorGroupPattern": "ESXi-Dev-Cluster",
+      "PerformancePolicy": "Dev-Bronze"
+    }
+  },
+  "PerformancePolicies": {
+    "SQL-Gold": {
+      "Name": "SQL-Gold",
+      "Description": "High performance for SQL workloads"
+    },
+    "VMware ESXi": {
+      "Name": "VMware ESXi",
+      "Description": "Standard VMware ESXi performance"
+    },
+    "Dev-Bronze": {
+      "Name": "Dev-Bronze",
+      "Description": "Low cost for dev/test environments"
+    }
+  },
+  "NamingConventions": {
+    "Production": "s-<app>-<env>-<num>",
+    "Development": "s-<app>-dev-<num>",
+    "Temporary": "s-tmp-<purpose>-<date>"
+  }
+}

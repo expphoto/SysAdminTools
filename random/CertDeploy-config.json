@@ -1,0 +1,110 @@
+{
+  "GlobalSettings": {
+    "CAServer": "CA01.domain.local",
+    "CertShareUNC": "\\\\certshare.domain.local\\certificates",
+    "DefaultPFXPasswordMode": "Prompt",
+    "LoggingPath": "C:\\Logs\\CertDeploy",
+    "StagingPath": ".\\staging",
+    "TestModeServers": [],
+    "ExpirationWarningDays": [30, 60, 90]
+  },
+  "GoDaddy": {
+    "Enabled": false,
+    "ApiKey": "",
+    "ApiSecret": "",
+    "ShopperId": "",
+    "UseV2Api": false
+  },
+  "Certificates": [
+    {
+      "FriendlyName": "webapp-frontend",
+      "ExpectedDomains": [
+        "webapp.domain.com",
+        "www.webapp.domain.com"
+      ],
+      "GoDaddy": {
+        "CertificateId": "",
+        "EntitlementId": ""
+      },
+      "Targets": [
+        {
+          "Server": "WEB01.domain.local",
+          "Sites": [
+            {
+              "Name": "Default Web Site",
+              "HostHeader": "webapp.domain.com",
+              "Port": 443,
+              "IPAddress": "*",
+              "SNI": true,
+              "HealthCheckURL": "https://webapp.domain.com/health"
+            }
+          ]
+        },
+        {
+          "Server": "WEB02.domain.local",
+          "Sites": [
+            {
+              "Name": "Default Web Site",
+              "HostHeader": "webapp.domain.com",
+              "Port": 443,
+              "IPAddress": "*",
+              "SNI": true,
+              "HealthCheckURL": "https://webapp.domain.com/health"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "FriendlyName": "api-gateway",
+      "ExpectedDomains": [
+        "api.domain.com"
+      ],
+      "GoDaddy": {
+        "CertificateId": "",
+        "EntitlementId": ""
+      },
+      "Targets": [
+        {
+          "Server": "API01.domain.local",
+          "Sites": [
+            {
+              "Name": "API Gateway",
+              "HostHeader": "api.domain.com",
+              "Port": 443,
+              "IPAddress": "*",
+              "SNI": false,
+              "HealthCheckURL": "https://api.domain.com/status"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "FriendlyName": "wildcard-domain",
+      "ExpectedDomains": [
+        "*.domain.com",
+        "domain.com"
+      ],
+      "GoDaddy": {
+        "CertificateId": "",
+        "EntitlementId": ""
+      },
+      "Targets": [
+        {
+          "Server": "WEB01.domain.local",
+          "Sites": [
+            {
+              "Name": "Default Web Site",
+              "HostHeader": "test.domain.com",
+              "Port": 443,
+              "IPAddress": "*",
+              "SNI": true,
+              "HealthCheckURL": "https://test.domain.com/health"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
