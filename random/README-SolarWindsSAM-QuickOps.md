@@ -2,7 +2,34 @@
 
 ## Overview
 
-SolarWinds SAM QuickOps is an interactive TUI (Text User Interface) application that provides a GUI-like experience for managing SolarWinds SAM without the web console. It enables quick access to common operations like node management, template deployment, alert management, and maintenance mode.
+SolarWinds SAM QuickOps is an interactive TUI (Text User Interface) application that provides a GUI-like experience for managing SolarWinds SAM without web console. It enables quick access to common operations like node management, template deployment, alert management, and maintenance mode.
+
+## New in Version 2.0
+
+### Phase 2 Enhancements (NEW)
+
+**1. Maintenance Calendar View**
+- Visual timeline of maintenance windows
+- Color-coded status (Active/Scheduled/Expired)
+- Extend, end early, or resume operations
+- Time remaining countdown display
+
+**2. Export Capabilities**
+- Export nodes to CSV/JSON
+- Export alerts to CSV/JSON
+- Export applications per node to CSV/JSON
+- Timestamped export files
+
+**3. Multi-Select Interface**
+- SPACE bar to select/deselect items
+- Visual indicators for selected items [X] vs [ ]
+- Select All with 'A' key
+- Improved bulk operation UX
+
+**4. Enhanced Dashboard**
+- More detailed statistics
+- Maintenance status in main dashboard
+- Export options directly from dashboard
 
 ## Prerequisites
 
