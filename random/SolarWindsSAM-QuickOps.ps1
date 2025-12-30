@@ -105,10 +105,11 @@ function Get-SWServerCertificate {
 
         $sanExtension = $cert.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" } | Select-Object -First 1
         $sanText = if ($sanExtension) { $sanExtension.Format($true) } else { "" }
-        $subjectMatches = $cert.Subject -match "CN=$HostName" -or $cert.Subject -match "CN=\*\.$HostName"
+        $escapedHost = [regex]::Escape($HostName)
+        $subjectMatches = $cert.Subject -match "CN=$escapedHost" -or $cert.Subject -match "CN=\*\.$escapedHost"
         $sanMatches = $false
         if ($sanText) {
-            $sanMatches = ($sanText -match "DNS Name=\s*$HostName(\s|$)") -or ($sanText -match "DNS Name=\s*\*\.$HostName(\s|$)")
+            $sanMatches = ($sanText -match "DNS Name=\s*$escapedHost([,\s]|$)") -or ($sanText -match "DNS Name=\s*\*\.$escapedHost([,\s]|$)")
         }
 
         if (-not ($subjectMatches -or $sanMatches)) {
