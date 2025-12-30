@@ -2200,6 +2200,12 @@ try {
             switch ($choice) {
                 "Y" {
                     Get-SWServerCertificate -HostName $SwisServer -Port $SwisCertPort -Install | Out-Null
+                    $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                    if (-not $queryTest.Success) {
+                        Write-SWLog "Query still failing after cert install." -Level WARNING
+                    } else {
+                        Write-SWLog "Query succeeded after cert install." -Level SUCCESS
+                    }
                 }
                 "T" {
                     Invoke-SWCertTroubleshoot -Server $SwisServer -Port $SwisCertPort
