@@ -472,7 +472,6 @@ function Get-SWSelection {
                     default { "Gray" }
                 }
                 Write-Host "  $selector " -NoNewline -ForegroundColor $selectColor
-                Write-Host " -NoNewline
                 Write-Host " $($i + 1). $displayValue" -NoNewline -ForegroundColor White
                 Write-Host " $statusText" -ForegroundColor $statusColor
             } else {
@@ -497,7 +496,7 @@ function Get-SWSelection {
         switch ($key) {
             { $_ -eq "Enter" } {
                 $selected = @()
-                foreach ($i = 0; $i -lt $Items.Count; $i++) {
+                for ($i = 0; $i -lt $Items.Count; $i++) {
                     if ($selectedIndices.ContainsKey($i) -and $selectedIndices[$i]) {
                         $selected += $Items[$i]
                     }
@@ -576,9 +575,13 @@ function Show-MainMenu {
         if ($stats) {
             Write-SWLog "DASHBOARD SUMMARY" -Level HEADER
             Write-SWLog "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Level HEADER
-            Write-SWLog "  Nodes: $($stats.Nodes.TotalNodes) total | $($stats.Nodes.UpNodes) Up ($([math]::Round(($stats.Nodes.UpNodes / $stats.Nodes.TotalNodes) * 100, 0))%) | $($stats.Nodes.DownNodes) Down | $($stats.Nodes.UnmanagedNodes) Unmanaged" -Level INFO
-            Write-SWLog "  Apps: $($stats.Apps.TotalApps) total | $($stats.Apps.UpApps) Available ($([math]::Round(($stats.Apps.UpApps / $stats.Apps.TotalApps) * 100, 0))%) | $($stats.Apps.DownApps) Down | $($stats.Apps.WarningApps) Warning" -Level INFO
-            Write-SWLog "  Alerts: $($stats.Alerts.TotalAlerts) active | $($stats.Alerts.CriticalAlerts) Critical | $($stats.Alerts.WarningAlerts) Warning | $($stats.Alerts.UnacknowledgedAlerts) Unacknowledged" -Level INFO
+            $nodeUpPct = [math]::Round(($stats.Nodes.UpNodes / $stats.Nodes.TotalNodes) * 100, 0)
+            Write-SWLog "  Nodes: $($stats.Nodes.TotalNodes) total - $($stats.Nodes.UpNodes) Up ($nodeUpPct) - $($stats.Nodes.DownNodes) Down - $($stats.Nodes.UnmanagedNodes) Unmanaged" -Level INFO
+
+            $appUpPct = [math]::Round(($stats.Apps.UpApps / $stats.Apps.TotalApps) * 100, 0)
+            Write-SWLog "  Apps: $($stats.Apps.TotalApps) total - $($stats.Apps.UpApps) Available ($appUpPct) - $($stats.Apps.DownApps) Down - $($stats.Apps.WarningApps) Warning" -Level INFO
+
+            Write-SWLog "  Alerts: $($stats.Alerts.TotalAlerts) active - $($stats.Alerts.CriticalAlerts) Critical - $($stats.Alerts.WarningAlerts) Warning - $($stats.Alerts.UnacknowledgedAlerts) Unacknowledged" -Level INFO
             Write-SWLog "  Maintenance: $($stats.MaintenanceCount) nodes currently unmanaged" -Level INFO
             Write-Host ""
         }
@@ -1394,26 +1397,23 @@ function Invoke-MaintenanceManagement {
                         } catch {
                             Write-SWLog "Invalid date format" -Level ERROR
                         }
-                    } catch {
-                        Write-SWLog "Invalid date format" -Level ERROR
-                    }
 
-                    Read-Host "Press Enter to continue"
+                        Read-Host "Press Enter to continue"
                     }
 
                     "0" {
                         break
                     }
-                }
             }
+        }
 
-            "3" {
-                break
-            }
+        "3" {
+            break
+        }
 
-            "0" {
-                break
-            }
+        "0" {
+            break
+        }
 
             default {
                 Write-SWLog "Invalid selection" -Level WARNING
@@ -1899,18 +1899,26 @@ function Invoke-DashboardView {
     Write-SWLog "Node Statistics" -Level HEADER
     Write-SWLog "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Level HEADER
     Write-SWLog "  Total Nodes: $($stats.Nodes.TotalNodes)" -Level INFO
-    Write-SWLog "  Up: $($stats.Nodes.UpNodes) ($([math]::Round(($stats.Nodes.UpNodes / $stats.Nodes.TotalNodes) * 100, 0))%)" -Level SUCCESS
+
+    $nodeUpPct2 = [math]::Round(($stats.Nodes.UpNodes / $stats.Nodes.TotalNodes) * 100, 0)
+    Write-SWLog "  Up: $($stats.Nodes.UpNodes) ($nodeUpPct2)" -Level SUCCESS
     Write-SWLog "  Down: $($stats.Nodes.DownNodes)" -Level ERROR
     Write-SWLog "  Warning: $($stats.Nodes.WarningNodes)" -Level WARNING
     Write-SWLog "  Unmanaged: $($stats.Nodes.UnmanagedNodes)" -Level INFO
-    Write-SWLog "  Average CPU: $([math]::Round($stats.Nodes.AvgCPU, 1))%" -Level INFO
-    Write-SWLog "  Average Response: $([math]::Round($stats.Nodes.AvgResponseTime, 1))ms" -Level INFO
+
+    $avgCPU = [math]::Round($stats.Nodes.AvgCPU, 1)
+    Write-SWLog "  Average CPU: $avgCPU" -Level INFO
+
+    $avgResp = [math]::Round($stats.Nodes.AvgResponseTime, 1)
+    Write-SWLog "  Average Response: ${avgResp}ms" -Level INFO
 
     Write-SWLog ""
     Write-SWLog "Application Statistics" -Level HEADER
     Write-SWLog "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Level HEADER
     Write-SWLog "  Total Apps: $($stats.Apps.TotalApps)" -Level INFO
-    Write-SWLog "  Available: $($stats.Apps.UpApps) ($([math]::Round(($stats.Apps.UpApps / $stats.Apps.TotalApps) * 100, 0))%)" -Level SUCCESS
+
+    $appUpPct2 = [math]::Round(($stats.Apps.UpApps / $stats.Apps.TotalApps) * 100, 0)
+    Write-SWLog "  Available: $($stats.Apps.UpApps) ($appUpPct2)" -Level SUCCESS
     Write-SWLog "  Down: $($stats.Apps.DownApps)" -Level ERROR
     Write-SWLog "  Warning: $($stats.Apps.WarningApps)" -Level WARNING
 
