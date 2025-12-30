@@ -2203,6 +2203,22 @@ try {
                     $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
                     if (-not $queryTest.Success) {
                         Write-SWLog "Query still failing after cert install." -Level WARNING
+                        $retryHost = Read-Host "Try again with a different hostname/FQDN? (enter host or leave blank to skip)"
+                        if ($retryHost) {
+                            $SwisServer = $retryHost
+                            $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
+                            if ($connection.Connected) {
+                                $script:SWConnection = $connection.Connection
+                                $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                                if ($queryTest.Success) {
+                                    Write-SWLog "Query succeeded after FQDN retry." -Level SUCCESS
+                                } else {
+                                    Write-SWLog "Query still failing after FQDN retry." -Level WARNING
+                                }
+                            } else {
+                                Write-SWLog "Failed to reconnect to $SwisServer" -Level ERROR
+                            }
+                        }
                     } else {
                         Write-SWLog "Query succeeded after cert install." -Level SUCCESS
                     }
