@@ -183,6 +183,33 @@ function Get-SWConnection {
     }
 }
 
+function Test-SWSwisQuery {
+    param([object]$Swis)
+
+    try {
+        $null = Get-SwisData -SwisConnection $Swis -Query "SELECT TOP 1 Caption FROM Orion.Nodes"
+        return @{ Success = $true }
+    } catch {
+        return @{ Success = $false; Error = $_ }
+    }
+}
+
+function Invoke-SWCertTroubleshoot {
+    param(
+        [string]$Server,
+        [int]$Port = 17778
+    )
+
+    Write-SWLog "Certificate troubleshooting" -Level HEADER
+    Write-SWLog "Checking cert on ${Server}:$Port" -Level INFO
+    $cert = Get-SWServerCertificate -HostName $Server -Port $Port
+
+    if ($cert) {
+        Write-SWLog "If this cert doesn't match the hostname, use the exact CN/SAN name." -Level INFO
+        Write-SWLog "Install the issuing root/intermediate certs in LocalMachine\Root/CA." -Level INFO
+    }
+}
+
 function Get-SWDashboardStats {
     param([object]$Swis)
 
@@ -2159,6 +2186,32 @@ try {
     }
 
     $script:SWConnection = $connection.Connection
+
+    $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+    if (-not $queryTest.Success) {
+        $errText = $queryTest.Error.Exception.Message
+        $innerText = if ($queryTest.Error.Exception.InnerException) { $queryTest.Error.Exception.InnerException.Message } else { "" }
+
+        if ($errText -like "*verifying security for the message*" -or $innerText -like "*verifying security for the message*") {
+            Write-SWLog "SWIS query failed due to message security validation." -Level ERROR
+            Write-SWLog "This is usually a certificate/hostname or trust chain issue." -Level WARNING
+
+            $choice = Read-Host "Troubleshoot now? (Y=trust cert, T=show cert details, N=continue anyway)"
+            switch ($choice) {
+                "Y" {
+                    Get-SWServerCertificate -HostName $SwisServer -Port $SwisCertPort -Install | Out-Null
+                }
+                "T" {
+                    Invoke-SWCertTroubleshoot -Server $SwisServer -Port $SwisCertPort
+                }
+                default {
+                    Write-SWLog "Continuing without cert changes" -Level WARNING
+                }
+            }
+        } else {
+            Write-SWLog "SWIS query test failed: $errText" -Level ERROR
+        }
+    }
 
     do {
         Show-MainMenu
