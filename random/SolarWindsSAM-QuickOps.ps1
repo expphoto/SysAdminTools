@@ -43,6 +43,12 @@ param(
 ,
     [Parameter(Mandatory = $false)]
     [switch]$DryRun
+,
+    [Parameter(Mandatory = $false)]
+    [switch]$TrustSwisCert
+,
+    [Parameter(Mandatory = $false)]
+    [int]$SwisCertPort = 17778
 )
 
 $ErrorActionPreference = "Stop"
@@ -74,6 +80,78 @@ function Write-SWLog {
         Write-Host "$timestamp$Message" -ForegroundColor $color -NoNewline
     } else {
         Write-Host "$timestamp$Message" -ForegroundColor $color
+    }
+}
+
+function Get-SWServerCertificate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HostName,
+
+        [Parameter(Mandatory = $false)]
+        [int]$Port = 17778,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Install
+    )
+
+    try {
+        Write-SWLog "Fetching certificate from ${HostName}:$Port" -Level INFO
+        $tcp = New-Object Net.Sockets.TcpClient($HostName, $Port)
+        $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, ({ $true }))
+        $ssl.AuthenticateAsClient($HostName)
+
+        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
+
+        $sanExtension = $cert.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" } | Select-Object -First 1
+        $sanText = if ($sanExtension) { $sanExtension.Format($true) } else { "" }
+        $subjectMatches = $cert.Subject -match "CN=$HostName" -or $cert.Subject -match "CN=\*\.$HostName"
+        $sanMatches = $false
+        if ($sanText) {
+            $sanMatches = ($sanText -match "DNS Name=\s*$HostName(\s|$)") -or ($sanText -match "DNS Name=\s*\*\.$HostName(\s|$)")
+        }
+
+        if (-not ($subjectMatches -or $sanMatches)) {
+            Write-SWLog "WARNING: Certificate name does not appear to match host '$HostName'" -Level WARNING
+            if ($sanText) {
+                Write-SWLog "Cert SANs: $sanText" -Level WARNING
+            } else {
+                Write-SWLog "Cert Subject: $($cert.Subject)" -Level WARNING
+            }
+        }
+
+        $path = Join-Path -Path $env:TEMP -ChildPath "$HostName-$Port.cer"
+        [IO.File]::WriteAllBytes($path, $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+
+        Write-SWLog "Cert Subject: $($cert.Subject)" -Level INFO
+        Write-SWLog "Thumbprint: $($cert.Thumbprint)" -Level INFO
+        Write-SWLog "Expires: $($cert.NotAfter)" -Level INFO
+        Write-SWLog "Saved cert to: $path" -Level INFO
+
+        if ($Install) {
+            try {
+                $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "LocalMachine")
+                $store.Open("ReadWrite")
+                $store.Add($cert)
+                $store.Close()
+                Write-SWLog "Installed cert to LocalMachine\Root" -Level SUCCESS
+            } catch {
+                Write-SWLog "Failed to install to LocalMachine\Root, trying CurrentUser\Root" -Level WARNING
+                $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "CurrentUser")
+                $store.Open("ReadWrite")
+                $store.Add($cert)
+                $store.Close()
+                Write-SWLog "Installed cert to CurrentUser\Root" -Level SUCCESS
+            }
+        }
+
+        $ssl.Close()
+        $tcp.Close()
+
+        return $cert
+    } catch {
+        Write-SWLog "Failed to fetch/install certificate: $_" -Level ERROR
+        return $null
     }
 }
 
@@ -2047,7 +2125,18 @@ try {
         Write-SWLog "Would connect to SWIS server: $SwisServer" -Level INFO
         Write-SWLog "Would prompt for credentials if not supplied" -Level INFO
         Write-SWLog "Would show main menu and execute selected actions" -Level INFO
+        Write-SWLog "Use -TrustSwisCert to fetch/install the SWIS cert" -Level INFO
         exit 0
+    }
+
+    if ($TrustSwisCert) {
+        if (-not $SwisServer) {
+            Write-SWLog "Enter SolarWinds SWIS server (FQDN preferred):" -Level PROMPT -NoNewline
+            $SwisServer = Read-Host
+        }
+
+        Get-SWServerCertificate -HostName $SwisServer -Port $SwisCertPort -Install | Out-Null
+        Write-SWLog "Proceeding with connection using $SwisServer" -Level INFO
     }
 
     if (-not $SwisServer) {
