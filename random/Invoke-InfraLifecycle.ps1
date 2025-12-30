@@ -1,5 +1,3 @@
-#Requires -Modules VMware.PowerCLI
-
 <#
 .SYNOPSIS
 Infrastructure State Controller - Intent-Based Storage Fabric Orchestration
@@ -118,7 +116,22 @@ param(
 
     [Parameter(Mandatory = $false)]
     [int]$MaxSnapshotAgeDays = 30
+,
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
+
+if (-not (Get-Module -ListAvailable -Name VMware.PowerCLI)) {
+    throw "VMware.PowerCLI module is required. Install it with: Install-Module VMware.PowerCLI"
+}
+
+if (-not (Get-Module -Name VMware.PowerCLI)) {
+    Import-Module -Name VMware.PowerCLI -ErrorAction Stop
+}
+
+if ($DryRun) {
+    $WhatIfPreference = $true
+}
 
 #region Helper Functions
 
@@ -1316,6 +1329,7 @@ function Invoke-AuditMode {
 
 #region Interactive Menu Functions
 
+<# LEGACY MENU BLOCK (replaced due to corrupted characters)
 function Show-MainMenu {
     Clear-Host
 
@@ -1346,6 +1360,42 @@ function Show-MainMenu {
     Write-Host "  7. View cluster information" -ForegroundColor White
     Write-Host "  8. View available volumes" -ForegroundColor White
     Write-Host "  0. Exit" -ForegroundColor Red
+    Write-Host ""
+}
+
+#>
+function Show-MainMenu {
+    Clear-Host
+
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "    Infrastructure State Controller - Interactive Menu     " -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    Write-Host "Connected to:" -ForegroundColor Yellow
+    if ($script:ConnectedNimble) {
+        Write-Host "  [x] Nimble: $NimbleServer" -ForegroundColor Green
+    } else {
+        Write-Host "  [ ] Nimble: $NimbleServer" -ForegroundColor Red
+    }
+
+    if ($script:ConnectedvCenter) {
+        Write-Host "  [x] vCenter: $vCenterServer" -ForegroundColor Green
+    } else {
+        Write-Host "  [ ] vCenter: $vCenterServer" -ForegroundColor Red
+    }
+
+    Write-Host ""
+    Write-Host "Select an operation:" -ForegroundColor White
+    Write-Host "  1. Provision new datastore" -ForegroundColor White
+    Write-Host "  2. Clone volume (Dev environment)" -ForegroundColor White
+    Write-Host "  3. Expand existing datastore" -ForegroundColor White
+    Write-Host "  4. Retire datastore" -ForegroundColor White
+    Write-Host "  5. Audit infrastructure" -ForegroundColor White
+    Write-Host "  6. Connect to Nimble/vCenter" -ForegroundColor Yellow
+    Write-Host "  7. View cluster information" -ForegroundColor White
+    Write-Host "  8. View available volumes" -ForegroundColor White
+    Write-Host "  0. Exit" -ForegroundColor White
     Write-Host ""
 }
 
@@ -1467,9 +1517,9 @@ function Show-ClusterInfo {
 
         Write-Host ""
         Write-Host "Storage Summary:" -ForegroundColor Yellow
-        Write-Host "  Total Capacity: $([math]::Round($totalCapacity/1TB, 2)) TB" -ForegroundColor White
-        Write-Host "  Used Space: $([math]::Round($usedSpace, 2)) GB ($([math]::Round(($usedSpace/$totalCapacity)*100, 1))%)" -ForegroundColor White
-        Write-Host "  Free Space: $([math]::Round($freeSpace/1TB, 2)) TB" -ForegroundColor White
+        Write-Host ("  Total Capacity: {0} TB" -f [math]::Round($totalCapacity/1TB, 2)) -ForegroundColor White
+        Write-Host ("  Used Space: {0} GB ({1}%)" -f [math]::Round($usedSpace, 2), [math]::Round(($usedSpace/$totalCapacity)*100, 1)) -ForegroundColor White
+        Write-Host ("  Free Space: {0} TB" -f [math]::Round($freeSpace/1TB, 2)) -ForegroundColor White
 
         Write-Host ""
         Write-Host "Hosts:" -ForegroundColor Yellow
@@ -1484,7 +1534,7 @@ function Show-ClusterInfo {
         Write-Host "Top 5 Datastores (by used space):" -ForegroundColor Yellow
         $datastores | Sort-Object UsedSpaceGB -Descending | Select-Object -First 5 | ForEach-Object {
             $percent = [math]::Round($_.FreeSpaceGB / $_.CapacityGB * 100, 1)
-            Write-Host "  - $($_.Name) : $([math]::Round($_.UsedSpaceGB, 2)) GB / $([math]::Round($_.CapacityGB, 2)) GB ($percent% free)" -ForegroundColor White
+            Write-Host ("  - {0} : {1} GB / {2} GB ({3}% free)" -f $_.Name, [math]::Round($_.UsedSpaceGB, 2), [math]::Round($_.CapacityGB, 2), $percent) -ForegroundColor White
         }
 
     } catch {
@@ -2065,6 +2115,18 @@ $script:LogFile = $null
 
 try {
     Initialize-InfraLogging -Path $LogPath
+
+    if ($DryRun) {
+        if (-not $NimbleServer) { $NimbleServer = "(not set)" }
+        if (-not $vCenterServer) { $vCenterServer = "(not set)" }
+
+        Write-InfraLog "DRY RUN: no changes will be made" -Level WARNING
+        Write-InfraLog "Would connect to Nimble: $NimbleServer" -Level INFO
+        Write-InfraLog "Would connect to vCenter: $vCenterServer" -Level INFO
+        Write-InfraLog "Would execute intent: $Intent" -Level INFO
+        Write-InfraLog "Use -WhatIf to see per-action simulation where supported" -Level INFO
+        exit 0
+    }
 
     if ($Intent -eq "Menu") {
         if (-not $NimbleServer -or -not $vCenterServer) {

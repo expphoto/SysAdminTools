@@ -40,6 +40,9 @@ param(
 
     [Parameter(Mandatory = $false)]
     [securestring]$Password
+,
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,7 +54,7 @@ function Write-SWLog {
         [string]$Message,
         [ValidateSet("INFO", "WARNING", "ERROR", "DEBUG", "SUCCESS", "HEADER", "PROMPT")]
         [string]$Level = "INFO",
-        [bool]$NoNewLine = $false
+        [switch]$NoNewLine
     )
 
     $color = switch ($Level) {
@@ -490,7 +493,7 @@ function Get-SWSelection {
 
     Show-SelectionList -ItemsList $Items -SelectedMap $selectedIndices
 
-    do {
+    :mainMenuLoop do {
         $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown").Key
 
         switch ($key) {
@@ -550,6 +553,7 @@ function Get-SWSelection {
 
 #region Menu Functions
 
+<# LEGACY MENU BLOCK (replaced due to corrupted characters)
 function Show-MainMenu {
     Clear-Host
 
@@ -589,6 +593,62 @@ function Show-MainMenu {
 
     Write-SWLog "SELECT AN OPERATION" -Level HEADER
     Write-SWLog "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Level HEADER
+    Write-SWLog "  1. Node Management (Search, View, Bulk Actions)" -Level INFO
+    Write-SWLog "  2. Template Management (List, Create, Assign)" -Level INFO
+    Write-SWLog "  3. Application Monitors (View, Deploy, Configure)" -Level INFO
+    Write-SWLog "  4. Alert Management (View, Acknowledge, Create)" -Level INFO
+    Write-SWLog "  5. Maintenance Mode (Enter, Exit, Calendar)" -Level INFO
+    Write-SWLog "  6. Dashboard & Statistics (Full detailed views)" -Level INFO
+    Write-SWLog "  7. Quick Actions (Frequent operations)" -Level INFO
+    Write-SWLog "  8. Export Data (Nodes, Alerts, Applications)" -Level INFO
+    Write-SWLog "  9. Settings & Connection" -Level INFO
+    Write-SWLog "  0. Exit" -Level INFO
+    Write-Host ""
+
+    Write-SWLog "QUICK SHORTCUTS: [N]ode Search  [T]emplates  [A]lerts  [M]aintenance  [R]efresh [E]xport" -Level PROMPT
+    Write-SWLog ""
+}
+
+#>
+function Show-MainMenu {
+    Clear-Host
+
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "        SolarWinds SAM QuickOps - Interactive Manager V2.0        " -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    if ($script:SWConnection) {
+        Write-SWLog "Connected to: $script:SWServer" -Level SUCCESS
+        if ($script:SWLastRefresh) {
+            $refreshAge = ((Get-Date) - $script:SWLastRefresh).TotalMinutes
+            Write-SWLog ("Last refresh: {0} min ago" -f $refreshAge.ToString('F0')) -Level DEBUG
+        }
+    } else {
+        Write-SWLog "Not connected" -Level ERROR
+    }
+
+    Write-Host ""
+
+    if ($script:SWConnection) {
+        $stats = Get-SWDashboardStats -Swis $script:SWConnection
+        if ($stats) {
+            Write-SWLog "DASHBOARD SUMMARY" -Level HEADER
+            Write-SWLog "----------------------------------------" -Level HEADER
+            $nodeUpPct = [math]::Round(($stats.Nodes.UpNodes / $stats.Nodes.TotalNodes) * 100, 0)
+            Write-SWLog "  Nodes: $($stats.Nodes.TotalNodes) total - $($stats.Nodes.UpNodes) Up ($nodeUpPct) - $($stats.Nodes.DownNodes) Down - $($stats.Nodes.UnmanagedNodes) Unmanaged" -Level INFO
+
+            $appUpPct = [math]::Round(($stats.Apps.UpApps / $stats.Apps.TotalApps) * 100, 0)
+            Write-SWLog "  Apps: $($stats.Apps.TotalApps) total - $($stats.Apps.UpApps) Available ($appUpPct) - $($stats.Apps.DownApps) Down - $($stats.Apps.WarningApps) Warning" -Level INFO
+
+            Write-SWLog "  Alerts: $($stats.Alerts.TotalAlerts) active - $($stats.Alerts.CriticalAlerts) Critical - $($stats.Alerts.WarningAlerts) Warning - $($stats.Alerts.UnacknowledgedAlerts) Unacknowledged" -Level INFO
+            Write-SWLog "  Maintenance: $($stats.MaintenanceCount) nodes currently unmanaged" -Level INFO
+            Write-Host ""
+        }
+    }
+
+    Write-SWLog "SELECT AN OPERATION" -Level HEADER
+    Write-SWLog "----------------------------------------" -Level HEADER
     Write-SWLog "  1. Node Management (Search, View, Bulk Actions)" -Level INFO
     Write-SWLog "  2. Template Management (List, Create, Assign)" -Level INFO
     Write-SWLog "  3. Application Monitors (View, Deploy, Configure)" -Level INFO
@@ -1978,6 +2038,18 @@ $script:SWServer = $null
 $script:SWLastRefresh = $null
 
 try {
+    if ($DryRun) {
+        if (-not $SwisServer) {
+            $SwisServer = "(not set)"
+        }
+
+        Write-SWLog "DRY RUN: no changes will be made" -Level WARNING
+        Write-SWLog "Would connect to SWIS server: $SwisServer" -Level INFO
+        Write-SWLog "Would prompt for credentials if not supplied" -Level INFO
+        Write-SWLog "Would show main menu and execute selected actions" -Level INFO
+        exit 0
+    }
+
     if (-not $SwisServer) {
         Write-SWLog "Enter SolarWinds SWIS server:" -Level PROMPT -NoNewline
         $SwisServer = Read-Host
@@ -2071,7 +2143,7 @@ try {
             "0" {
                 Clear-Host
                 Write-SWLog "Goodbye!" -Level SUCCESS
-                break
+                break mainMenuLoop
             }
 
             default {
@@ -2083,7 +2155,9 @@ try {
 
 } finally {
     if ($script:SWConnection) {
-        Disconnect-Swis -SwisConnection $script:SWConnection -ErrorAction SilentlyContinue
+        if (Get-Command Disconnect-Swis -ErrorAction SilentlyContinue) {
+            Disconnect-Swis -SwisConnection $script:SWConnection -ErrorAction SilentlyContinue
+        }
         Write-SWLog "Disconnected from SolarWinds" -Level INFO
     }
 }
