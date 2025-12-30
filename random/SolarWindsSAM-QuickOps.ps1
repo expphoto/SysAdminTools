@@ -746,7 +746,7 @@ function Show-MainMenu {
 function Invoke-NodeManagement {
     param([object]$Swis)
 
-    do {
+    :nodeMenu do {
         Clear-Host
         Write-SWLog "=== NODE MANAGEMENT ===" -Level HEADER
         Write-SWLog ""
@@ -844,7 +844,7 @@ function Invoke-NodeManagement {
             }
 
             "0" {
-                break
+                break nodeMenu
             }
         }
     } while ($true)
@@ -960,7 +960,7 @@ function Show-SWNodeDetails {
 function Invoke-TemplateManagement {
     param([object]$Swis)
 
-    do {
+    :templateMenu do {
         Clear-Host
         Write-SWLog "=== TEMPLATE MANAGEMENT ===" -Level HEADER
         Write-SWLog ""
@@ -1110,7 +1110,7 @@ function Invoke-TemplateManagement {
             }
 
             "0" {
-                break
+                break templateMenu
             }
         }
     } while ($true)
@@ -1119,7 +1119,7 @@ function Invoke-TemplateManagement {
 function Invoke-AlertManagement {
     param([object]$Swis)
 
-    do {
+    :alertMenu do {
         Clear-Host
         Write-SWLog "=== ALERT MANAGEMENT ===" -Level HEADER
         Write-SWLog ""
@@ -1296,7 +1296,7 @@ function Invoke-AlertManagement {
             }
 
             "0" {
-                break
+                break alertMenu
             }
         }
     } while ($true)
@@ -1305,7 +1305,7 @@ function Invoke-AlertManagement {
 function Invoke-MaintenanceManagement {
     param([object]$Swis)
 
-    do {
+    :maintenanceMenu do {
         Clear-Host
         Write-SWLog "=== MAINTENANCE MODE ===" -Level HEADER
         Write-SWLog ""
@@ -1550,7 +1550,7 @@ function Invoke-MaintenanceManagement {
         }
 
         "0" {
-            break
+            break maintenanceMenu
         }
 
             default {
@@ -1563,7 +1563,7 @@ function Invoke-MaintenanceManagement {
 function Invoke-ApplicationManagement {
     param([object]$Swis)
 
-    do {
+    :appMenu do {
         Clear-Host
         Write-SWLog "=== APPLICATION MONITOR MANAGEMENT ===" -Level HEADER
         Write-SWLog ""
@@ -1686,7 +1686,7 @@ function Invoke-ApplicationManagement {
             }
 
             "0" {
-                break
+                break appMenu
             }
         }
     } while ($true)
@@ -1801,7 +1801,7 @@ function Export-AlertData {
 function Invoke-ExportMenu {
     param([object]$Swis)
 
-    do {
+    :exportMenu do {
         Clear-Host
         Write-SWLog "=== EXPORT CAPABILITIES ===" -Level HEADER
         Write-SWLog ""
@@ -1908,7 +1908,7 @@ function Invoke-ExportMenu {
             }
 
             "0" {
-                break
+                break exportMenu
             }
 
             default {
@@ -1922,7 +1922,7 @@ function Invoke-ExportMenu {
 function Invoke-QuickActions {
     param([object]$Swis)
 
-    do {
+    :quickMenu do {
         Clear-Host
         Write-SWLog "=== QUICK ACTIONS ===" -Level HEADER
         Write-SWLog ""
@@ -2008,7 +2008,7 @@ function Invoke-QuickActions {
             }
 
             "0" {
-                break
+                break quickMenu
             }
 
             default {
