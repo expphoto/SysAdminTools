@@ -49,11 +49,29 @@ param(
 ,
     [Parameter(Mandatory = $false)]
     [int]$SwisCertPort = 17778
+,
+    [Parameter(Mandatory = $false)]
+    [switch]$AllowInsecure
 )
 
 $ErrorActionPreference = "Stop"
 
 #region Helper Functions
+
+# Define a legacy certificate policy for broad compatibility (especially with older .NET/WCF stacks)
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+    try {
+        Add-Type @"
+            using System.Net;
+            using System.Security.Cryptography.X509Certificates;
+            public class TrustAllCertsPolicy : ICertificatePolicy {
+                public bool CheckValidationResult(ServicePoint srvPoint, X509Certificate certificate, WebRequest request, int certificateProblem) {
+                    return true;
+                }
+            }
+"@ -ErrorAction SilentlyContinue
+    } catch {}
+}
 
 function Write-SWLog {
     param(
@@ -155,6 +173,117 @@ function Get-SWServerCertificate {
         return $null
     }
 }
+
+#region Cross-platform certificate helpers
+function Test-IsWindows { try { return ([System.Environment]::OSVersion.Platform -eq 'Win32NT') } catch { return $false } }
+function Test-IsMacOS { try { return ((uname) -eq 'Darwin') } catch { return $false } }
+
+function Get-SWCertNames {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert)
+    $cn = ""; if ($Cert.Subject -match "CN=([^,]+)") { $cn = $Matches[1].Trim() }
+    $dns = @(); $sanExt = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.17" } | Select-Object -First 1
+    if ($sanExt) { $txt = $sanExt.Format($true); foreach ($m in [regex]::Matches($txt, "DNS Name=\s*([^,\r\n]+)")) { $dns += $m.Groups[1].Value.Trim() } }
+    return @{ CN = $cn; DnsNames = $dns }
+}
+
+function Install-SWCertChain {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert)
+
+    if (Test-IsWindows) {
+        try {
+            $isSelfSigned = ($Cert.Subject -eq $Cert.Issuer)
+            $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+            $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+            [void]$chain.Build($Cert)
+            if ($isSelfSigned -or ($chain.ChainElements.Count -eq 1)) {
+                try {
+                    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store([System.Security.Cryptography.X509Certificates.StoreName]::Root, [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
+                    $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                    if (-not ($store.Certificates | Where-Object Thumbprint -eq $Cert.Thumbprint)) { $store.Add($Cert) }
+                    $store.Close()
+                    Write-SWLog "Installed self-signed cert to LocalMachine\\Root" -Level SUCCESS
+                } catch {
+                    Write-SWLog "LocalMachine\\Root failed; trying CurrentUser\\Root" -Level WARNING
+                    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store([System.Security.Cryptography.X509Certificates.StoreName]::Root, [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+                    $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                    if (-not ($store.Certificates | Where-Object Thumbprint -eq $Cert.Thumbprint)) { $store.Add($Cert) }
+                    $store.Close()
+                    Write-SWLog "Installed self-signed cert to CurrentUser\\Root" -Level SUCCESS
+                }
+                return @{ Success = $true; Platform = 'Windows'; SelfSigned = $true }
+            }
+            for ($i=1; $i -lt $chain.ChainElements.Count; $i++) {
+                $c = $chain.ChainElements[$i].Certificate
+                $isRoot = ($c.Subject -eq $c.Issuer)
+                if ($isRoot) {
+                    $rootStore = New-Object System.Security.Cryptography.X509Certificates.X509Store([System.Security.Cryptography.X509Certificates.StoreName]::Root, [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
+                    $rootStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                    if (-not ($rootStore.Certificates | Where-Object Thumbprint -eq $c.Thumbprint)) { $rootStore.Add($c) }
+                    $rootStore.Close()
+                    Write-SWLog "Ensured issuing Root CA in LocalMachine\\Root" -Level SUCCESS
+                } else {
+                    $caStore = New-Object System.Security.Cryptography.X509Certificates.X509Store([System.Security.Cryptography.X509Certificates.StoreName]::CA, [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
+                    $caStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                    if (-not ($caStore.Certificates | Where-Object Thumbprint -eq $c.Thumbprint)) { $caStore.Add($c) }
+                    $caStore.Close()
+                    Write-SWLog "Ensured Intermediate CA in LocalMachine\\CA" -Level SUCCESS
+                }
+            }
+            return @{ Success = $true; Platform = 'Windows'; SelfSigned = $false }
+        } catch {
+            Write-SWLog "Windows chain install failed: $_" -Level ERROR
+            return @{ Success = $false; Error = $_; Platform = 'Windows' }
+        }
+    }
+
+    if (Test-IsMacOS) {
+        try {
+            $isSelfSigned = ($Cert.Subject -eq $Cert.Issuer)
+            $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+            $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+            [void]$chain.Build($Cert)
+
+            function Add-MacKeychainCert([System.Security.Cryptography.X509Certificates.X509Certificate2]$c,[bool]$Root){
+                $tmp = Join-Path $env:TEMP ("swis-" + $c.Thumbprint + ".cer")
+                [IO.File]::WriteAllBytes($tmp, $c.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+                $args = @('add-trusted-cert','-d','-k','/Library/Keychains/System.keychain')
+                if ($Root) { $args += @('-r','trustRoot') }
+                $args += $tmp
+                $p = Start-Process -FilePath security -ArgumentList $args -PassThru -NoNewWindow -Wait -ErrorAction Stop
+                if ($p.ExitCode -ne 0) { Write-SWLog "security returned $($p.ExitCode). Try running with sudo." -Level WARNING }
+            }
+
+            if ($isSelfSigned -or ($chain.ChainElements.Count -eq 1)) {
+                Add-MacKeychainCert $Cert $true
+                Write-SWLog "Installed self-signed cert into macOS System keychain" -Level SUCCESS
+                return @{ Success = $true; Platform = 'macOS'; SelfSigned = $true }
+            }
+
+            for ($i=1; $i -lt $chain.ChainElements.Count; $i++) {
+                $c = $chain.ChainElements[$i].Certificate
+                $isRoot = ($c.Subject -eq $c.Issuer)
+                Add-MacKeychainCert $c $isRoot
+            }
+            Write-SWLog "Installed issuing chain into macOS System keychain" -Level SUCCESS
+            return @{ Success = $true; Platform = 'macOS'; SelfSigned = $false }
+        } catch {
+            Write-SWLog "macOS keychain install failed: $_" -Level ERROR
+            return @{ Success = $false; Error = $_; Platform = 'macOS' }
+        }
+    }
+
+    Write-SWLog "Non-Windows OS detected. Please install the SWIS issuing chain into your system trust store (e.g., update-ca-certificates)." -Level WARNING
+    return @{ Success = $false; Platform = 'Other' }
+}
+
+function Resolve-SWHostname { param([string]$InputHost,[hashtable]$CertNames)
+    $cn = $CertNames.CN; $dns = @($CertNames.DnsNames)
+    $all = @($dns + $cn) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($n in $all) { if ($n -ieq $InputHost) { return @{ Matches = $true; Suggested = $null; Names = $all } } }
+    $suggest = if ($dns.Count -gt 0) { $dns[0] } else { $cn }
+    return @{ Matches = $false; Suggested = $suggest; Names = $all }
+}
+#endregion
 
 function Get-SWConnection {
     param(
@@ -267,7 +396,7 @@ function Get-SWDashboardStats {
             MaintenanceNodes = $maintenanceNodes
         }
     } catch {
-        Write-SWLog "Failed to get dashboard stats: $_" -Level ERROR
+        Write-SWLog "Failed to get dashboard stats: $_" -Level DEBUG
         return $null
     }
 }
@@ -309,7 +438,7 @@ function Get-SWNodes {
             }
         }
 
-        $query += " ORDER BY Caption LIMIT $MaxResults"
+        $query = "SELECT TOP $MaxResults " + $query.Substring("SELECT ".Length)
 
         $params = @{}
         if ($SearchTerm) {
@@ -539,10 +668,20 @@ function Get-SWSelection {
         [array]$PreSelected = @()
     )
 
+    # Handle empty items list
+    if ($Items.Count -eq 0) {
+        Write-SWLog "=== $Title ===" -Level HEADER
+        Write-SWLog ""
+        Write-SWLog "No items found." -Level WARNING
+        Write-SWLog ""
+        Read-Host "Press Enter to go back"
+        return $null
+    }
+
     Clear-Host
     Write-SWLog "=== $Title ===" -Level HEADER
     Write-SWLog ""
-    Write-SWLog "Controls: SPACE = Select/Deselect | ENTER = Confirm | A = All | 0 = Back" -Level PROMPT
+    Write-SWLog "Controls: SPACE = Select/Deselect | ENTER = Confirm | A = All | ESC/0 = Back" -Level PROMPT
     Write-SWLog ""
 
     $selectedIndices = @{}
@@ -557,7 +696,7 @@ function Get-SWSelection {
         Clear-Host
         Write-SWLog "=== $Title ===" -Level HEADER
         Write-SWLog ""
-        Write-SWLog "Controls: SPACE = Select/Deselect | ENTER = Confirm | A = All | 0 = Back" -Level PROMPT
+        Write-SWLog "Controls: SPACE = Select/Deselect | ENTER = Confirm | A = All | ESC/0 = Back" -Level PROMPT
         Write-SWLog ""
 
         for ($i = 0; $i -lt $ItemsList.Count; $i++) {
@@ -643,7 +782,7 @@ function Get-SWSelection {
                 }
             }
 
-            { $_ -eq "0" } {
+            { $_ -eq "D0" -or $_ -eq "NumPad0" -or $_ -eq "Escape" } {
                 return $null
             }
 
@@ -681,7 +820,12 @@ function Show-MainMenu {
     Write-Host ""
 
     if ($script:SWConnection) {
-        $stats = Get-SWDashboardStats -Swis $script:SWConnection
+        if (-not $script:SWSafeMode) {
+            $stats = Get-SWDashboardStats -Swis $script:SWConnection
+        } else {
+            $stats = $null
+            Write-SWLog "SAFE MODE: Dashboard queries disabled due to certificate/connection issues." -Level WARNING
+        }
         if ($stats) {
             Write-SWLog "DASHBOARD SUMMARY" -Level HEADER
             Write-SWLog "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Level HEADER
@@ -737,7 +881,12 @@ function Show-MainMenu {
     Write-Host ""
 
     if ($script:SWConnection) {
-        $stats = Get-SWDashboardStats -Swis $script:SWConnection
+        if (-not $script:SWSafeMode) {
+            $stats = Get-SWDashboardStats -Swis $script:SWConnection
+        } else {
+            $stats = $null
+            Write-SWLog "SAFE MODE: Skipping live dashboard queries due to connection/certificate issues." -Level WARNING
+        }
         if ($stats) {
             Write-SWLog "DASHBOARD SUMMARY" -Level HEADER
             Write-SWLog "----------------------------------------" -Level HEADER
@@ -1570,21 +1719,21 @@ function Invoke-MaintenanceManagement {
                     "0" {
                         break
                     }
+                } # end switch $typeSel
+            }   # end case "2"
+
+            "3" {
+                break maintenanceMenu
             }
-        }
 
-        "3" {
-            break
-        }
-
-        "0" {
-            break maintenanceMenu
-        }
+            "0" {
+                break maintenanceMenu
+            }
 
             default {
                 Write-SWLog "Invalid selection" -Level WARNING
             }
-        }
+        } # end switch $selection
     } while ($true)
 }
 
@@ -2142,8 +2291,27 @@ function Invoke-DashboardView {
 $script:SWConnection = $null
 $script:SWServer = $null
 $script:SWLastRefresh = $null
+$script:SWSafeMode = $false
 
 try {
+    $origCertCallback = $null
+    # Always enable certificate bypass for SolarWinds self-signed certificates
+    Write-SWLog "Enabling certificate bypass for SolarWinds self-signed certificates..." -Level INFO
+    try {
+        $origCertCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { param($s,$c,$ch,$e) return $true }
+        [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false
+
+        # Apply legacy policy as well for SWIS/WCF compatibility
+        if (([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+            [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+        }
+
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Write-SWLog "Certificate bypass enabled successfully" -Level SUCCESS
+    } catch {
+        Write-SWLog "Failed to set certificate bypass: $_" -Level ERROR
+    }
     if ($DryRun) {
         if (-not $SwisServer) {
             $SwisServer = "(not set)"
@@ -2163,167 +2331,337 @@ try {
             $SwisServer = Read-Host
         }
 
-        Get-SWServerCertificate -HostName $SwisServer -Port $SwisCertPort -Install | Out-Null
-        Write-SWLog "Proceeding with connection using $SwisServer" -Level INFO
+        $cert = Get-SWServerCertificate -HostName $SwisServer -Port $SwisCertPort
+        if ($cert) {
+            Install-SWCertChain -Cert $cert | Out-Null
+            $names = Get-SWCertNames -Cert $cert
+            $res = Resolve-SWHostname -InputHost $SwisServer -CertNames $names
+            if (-not $res.Matches -and $res.Suggested) {
+                Write-SWLog "The supplied hostname '$SwisServer' does not match the certificate." -Level WARNING
+                Write-SWLog ("Valid names: " + ($res.Names -join ", ")) -Level INFO
+                $ans = Read-Host "Use '$($res.Suggested)' instead? (Y/n)"
+                if ([string]::IsNullOrWhiteSpace($ans) -or $ans -match '^[Yy]$') {
+                    $SwisServer = $res.Suggested
+                    Write-SWLog "Using suggested hostname: $SwisServer" -Level SUCCESS
+                }
+            }
+            Write-SWLog "Proceeding with connection using $SwisServer" -Level INFO
+        } else {
+            Write-SWLog "Could not retrieve server certificate; proceeding without trust changes." -Level WARNING
+        }
     }
 
-    if (-not $SwisServer) {
-        Write-SWLog "Enter SolarWinds SWIS server:" -Level PROMPT -NoNewline
-        $SwisServer = Read-Host
-    }
+    :scriptLoop while ($true) {
+        if (-not $SwisServer) {
+            Write-SWLog "Enter SolarWinds SWIS server:" -Level PROMPT -NoNewline
+            $SwisServer = Read-Host
+        }
 
-    if (-not $UserName) {
-        $credential = Get-Credential -Message "SolarWinds Credentials"
-        $UserName = $credential.UserName
-        $Password = $credential.Password
-    }
+        if (-not $UserName) {
+            $credential = Get-Credential -Message "SolarWinds Credentials"
+            $UserName = $credential.UserName
+            $Password = $credential.Password
+        }
 
-    $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
+        $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
 
-    if (-not $connection.Connected) {
-        Write-SWLog "Failed to connect to SolarWinds" -Level ERROR
-        exit 1
-    }
+        if (-not $connection.Connected) {
+            Write-SWLog "Failed to connect to SolarWinds" -Level ERROR
+            # Allow retry instead of exit
+            $retry = Read-Host "Retry connection? (Y/n)"
+            if ($retry -match '^[Nn]') { break :scriptLoop }
+            continue :scriptLoop
+        }
 
-    $script:SWConnection = $connection.Connection
+        $script:SWConnection = $connection.Connection
 
-    $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
-    if (-not $queryTest.Success) {
-        $errText = $queryTest.Error.Exception.Message
-        $innerText = if ($queryTest.Error.Exception.InnerException) { $queryTest.Error.Exception.InnerException.Message } else { "" }
+        $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+        if (-not $queryTest.Success) {
+            $errText = $queryTest.Error.Exception.Message
+            $innerText = if ($queryTest.Error.Exception.InnerException) { $queryTest.Error.Exception.InnerException.Message } else { "" }
 
-        if ($errText -like "*verifying security for the message*" -or $innerText -like "*verifying security for the message*") {
-            Write-SWLog "SWIS query failed due to message security validation." -Level ERROR
-            Write-SWLog "This is usually a certificate/hostname or trust chain issue." -Level WARNING
+            if ($errText -like "*verifying security for the message*" -or $innerText -like "*verifying security for the message*") {
+                Write-SWLog "SWIS query failed due to message security validation." -Level ERROR
+                Write-SWLog "This is usually a certificate/hostname or trust chain issue." -Level WARNING
 
-            $choice = Read-Host "Troubleshoot now? (Y=trust cert, T=show cert details, N=continue anyway)"
-            switch ($choice) {
-                "Y" {
-                    Get-SWServerCertificate -HostName $SwisServer -Port $SwisCertPort -Install | Out-Null
-                    $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
-                    if ($connection.Connected) {
-                        $script:SWConnection = $connection.Connection
-                    }
+                # Enable safe mode immediately to prevent query loops
+                $script:SWSafeMode = $true
 
-                    $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
-                    if (-not $queryTest.Success) {
-                        Write-SWLog "Query still failing after cert install." -Level WARNING
-                        $retryHost = Read-Host "Try again with a different hostname/FQDN? (enter host or leave blank to skip)"
-                        if ($retryHost) {
-                            $SwisServer = $retryHost
+                $troubleshootLoop = $true
+                while ($troubleshootLoop) {
+                    $choice = Read-Host "Troubleshoot now? (Y=trust cert, I=ignore cert errors, T=show cert details, N=continue anyway)"
+                    switch ($choice) {
+                    "I" {
+                        $troubleshootLoop = $false
+                        Write-SWLog "Enabling insecure certificate bypass for this session..." -Level WARNING
+                        try {
+                            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { param($s,$c,$ch,$e) return $true }
+                            [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false
+                            
+                            # Apply legacy policy as well for SWIS/WCF compatibility
+                            if (([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+                                [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+                            }
+
+                            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12                                
+                            
                             $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
                             if ($connection.Connected) {
                                 $script:SWConnection = $connection.Connection
                                 $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
                                 if ($queryTest.Success) {
-                                    Write-SWLog "Query succeeded after FQDN retry." -Level SUCCESS
+                                    Write-SWLog "Query succeeded with insecure bypass." -Level SUCCESS
+                                    $script:SWSafeMode = $false
                                 } else {
-                                    Write-SWLog "Query still failing after FQDN retry." -Level WARNING
+                                    Write-SWLog "Query still failing despite bypass." -Level ERROR
+                                    Write-SWLog "Error details: $($queryTest.Error)" -Level ERROR
+                                    Write-SWLog ""
+                                    Write-SWLog "The SwisPowerShell module uses WCF which requires certificates in the trust store." -Level INFO
+                                    Write-SWLog "Attempting to install server certificate automatically..." -Level INFO
+
+                                    $cert = Get-SWServerCertificate -HostName $SwisServer -Port $SwisCertPort
+                                    if ($cert) {
+                                        Install-SWCertChain -Cert $cert | Out-Null
+                                        Write-SWLog "Certificate installed. Reconnecting..." -Level INFO
+
+                                        # Check for hostname mismatch
+                                        $names = Get-SWCertNames -Cert $cert
+                                        $res = Resolve-SWHostname -InputHost $SwisServer -CertNames $names
+                                        if (-not $res.Matches -and $res.Suggested) {
+                                            Write-SWLog "Hostname mismatch detected. Certificate valid for: $($res.Names -join ', ')" -Level WARNING
+                                            $ans = Read-Host "Reconnect using '$($res.Suggested)'? (Y/n)"
+                                            if ([string]::IsNullOrWhiteSpace($ans) -or $ans -match '^[Yy]$') {
+                                                $SwisServer = $res.Suggested
+                                            }
+                                        }
+
+                                        # Reconnect with proper hostname
+                                        $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
+                                        if ($connection.Connected) {
+                                            $script:SWConnection = $connection.Connection
+                                            $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                                            if ($queryTest.Success) {
+                                                Write-SWLog "Query succeeded after certificate install!" -Level SUCCESS
+                                                $script:SWSafeMode = $false
+                                            } else {
+                                                Write-SWLog "Query still failing. This may require a PowerShell restart." -Level ERROR
+                                                $script:SWSafeMode = $true
+                                            }
+                                        }
+                                    } else {
+                                        Write-SWLog "Could not retrieve server certificate." -Level ERROR
+                                        $script:SWSafeMode = $true
+                                    }
+
+                                    Read-Host "Press Enter to continue"
                                 }
                             } else {
-                                Write-SWLog "Failed to reconnect to $SwisServer" -Level ERROR
+                                 Write-SWLog "Reconnection failed during bypass attempt." -Level ERROR
+                                 $script:SWSafeMode = $true
+                                 Read-Host "Press Enter to continue"
+                            }
+                        } catch {
+                            Write-SWLog "Failed to enable bypass: $_" -Level ERROR
+                            $script:SWSafeMode = $true
+                            Read-Host "Press Enter to continue"
+                        }
+                    }
+                        "Y" {
+                            $troubleshootLoop = $false
+                            $cert = Get-SWServerCertificate -HostName $SwisServer -Port $SwisCertPort
+                            if ($cert) {
+                                Install-SWCertChain -Cert $cert | Out-Null
+                                $names = Get-SWCertNames -Cert $cert
+                                $res = Resolve-SWHostname -InputHost $SwisServer -CertNames $names
+                                if (-not $res.Matches -and $res.Suggested) {
+                                    Write-SWLog ("Hostname mismatch. Valid names: " + ($res.Names -join ", ")) -Level WARNING
+                                    $ans = Read-Host "Reconnect using '$($res.Suggested)'? (Y/n)"
+                                    if ([string]::IsNullOrWhiteSpace($ans) -or $ans -match '^[Yy]$') { $SwisServer = $res.Suggested }
+                                }
+                            }
+                            $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
+                            if ($connection.Connected) {
+                                $script:SWConnection = $connection.Connection
+                            }
+
+                            $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                            if (-not $queryTest.Success) {
+                                Write-SWLog "Query still failing after cert install." -Level WARNING
+                                $retryHost = Read-Host "Try again with a different hostname/FQDN? (enter host or leave blank to skip)"
+                                if ($retryHost) {
+                                    $SwisServer = $retryHost
+                                    $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
+                                    if ($connection.Connected) {
+                                        $script:SWConnection = $connection.Connection
+                                        $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                                        if ($queryTest.Success) {
+                                            Write-SWLog "Query succeeded after FQDN retry." -Level SUCCESS
+                                        } else {
+                                            Write-SWLog "Query still failing after FQDN retry." -Level WARNING
+                                        }
+                                    } else {
+                                        Write-SWLog "Failed to reconnect to $SwisServer" -Level ERROR
+                                    }
+                                }
+                                if (-not $queryTest.Success) { 
+                                     Write-SWLog "Query still failing. Enabling insecure bypass as fallback..." -Level WARNING
+                                     try {
+                                        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { param($s,$c,$ch,$e) return $true }
+                                        [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false
+                                        
+                                        if (([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+                                            [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+                                        }
+
+                                        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                                        $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                                        if ($queryTest.Success) {
+                                            Write-SWLog "Query succeeded with insecure bypass." -Level SUCCESS
+                                            $script:SWSafeMode = $false
+                                        } else {
+                                            Write-SWLog "Query still failing despite bypass. Error: $($queryTest.Error)" -Level ERROR
+                                            $script:SWSafeMode = $true
+                                            Read-Host "Press Enter to continue"
+                                        }
+                                     } catch {
+                                         Write-SWLog "Bypass attempt failed: $_" -Level ERROR
+                                         $script:SWSafeMode = $true 
+                                         Read-Host "Press Enter to continue"
+                                     }
+                                }
+                            } else {
+                                Write-SWLog "Query succeeded after cert install." -Level SUCCESS
                             }
                         }
-                    } else {
-                        Write-SWLog "Query succeeded after cert install." -Level SUCCESS
+                        "T" {
+                            Invoke-SWCertTroubleshoot -Server $SwisServer -Port $SwisCertPort
+                            # Loop continues
+                        }
+                        "N" {
+                            $troubleshootLoop = $false
+                            Write-SWLog "Continuing without cert changes" -Level WARNING
+                        }
+                        default {
+                            Write-SWLog "Invalid selection." -Level WARNING
+                        }
                     }
                 }
-                "T" {
-                    Invoke-SWCertTroubleshoot -Server $SwisServer -Port $SwisCertPort
-                }
-                default {
-                    Write-SWLog "Continuing without cert changes" -Level WARNING
-                }
+            } else {
+                Write-SWLog "SWIS query test failed: $errText" -Level ERROR
+                $script:SWSafeMode = $true
             }
         } else {
-            Write-SWLog "SWIS query test failed: $errText" -Level ERROR
+            # Query test succeeded, ensure safe mode is disabled
+            $script:SWSafeMode = $false
         }
+
+        :mainMenuLoop do {
+            Show-MainMenu
+
+            Write-SWLog "Your selection:" -Level PROMPT -NoNewline
+            $selection = Read-Host
+
+            if ($selection -eq "R" -or $selection -eq "r") {
+                $script:SWLastRefresh = Get-Date
+                continue
+            }
+
+            if ($selection -eq "N" -or $selection -eq "n") {
+                if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry (Settings & Connection)." -Level WARNING; Start-Sleep -Seconds 1; continue }
+                Invoke-NodeManagement -Swis $script:SWConnection
+                continue
+            }
+
+            if ($selection -eq "T" -or $selection -eq "t") {
+                if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; Start-Sleep -Seconds 1; continue }
+                Invoke-TemplateManagement -Swis $script:SWConnection
+                continue
+            }
+
+            if ($selection -eq "A" -or $selection -eq "a") {
+                if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; Start-Sleep -Seconds 1; continue }
+                Invoke-AlertManagement -Swis $script:SWConnection
+                continue
+            }
+
+            if ($selection -eq "M" -or $selection -eq "m") {
+                if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; Start-Sleep -Seconds 1; continue }
+                Invoke-MaintenanceManagement -Swis $script:SWConnection
+                continue
+            }
+
+            switch ($selection) {
+                "1" {
+                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; break }
+                    Invoke-NodeManagement -Swis $script:SWConnection
+                }
+
+                "2" {
+                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; break }
+                    Invoke-TemplateManagement -Swis $script:SWConnection
+                }
+
+                "3" {
+                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; break }
+                    Invoke-ApplicationManagement -Swis $script:SWConnection
+                }
+
+                "4" {
+                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; break }
+                    Invoke-AlertManagement -Swis $script:SWConnection
+                }
+
+                "5" {
+                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; break }
+                    Invoke-MaintenanceManagement -Swis $script:SWConnection
+                }
+
+                "6" {
+                    Invoke-DashboardView -Swis $script:SWConnection
+                }
+
+                "7" {
+                    Invoke-QuickActions -Swis $script:SWConnection
+                }
+
+                "8" {
+                    Invoke-ExportMenu -Swis $script:SWConnection
+                }
+
+                "9" {
+                    Write-SWLog "Current connection: $script:SWServer" -Level INFO
+                    $newHost = Read-Host "Enter new hostname (leave blank to keep $script:SWServer)"
+                    if (-not [string]::IsNullOrWhiteSpace($newHost)) {
+                        $SwisServer = $newHost
+                    }
+                    if ($script:SWConnection) {
+                        if (Get-Command Disconnect-Swis -ErrorAction SilentlyContinue) {
+                            Disconnect-Swis -SwisConnection $script:SWConnection -ErrorAction SilentlyContinue
+                        }
+                    }
+                    continue :scriptLoop
+                }
+
+                "0" {
+                    Clear-Host
+                    Write-SWLog "Goodbye!" -Level SUCCESS
+                    break :scriptLoop
+                }
+
+                default {
+                    Write-SWLog "Invalid selection. Please try again." -Level WARNING
+                    Start-Sleep -Seconds 1
+                }
+            }
+        } while ($true)
     }
 
-    do {
-        Show-MainMenu
-
-        Write-SWLog "Your selection:" -Level PROMPT -NoNewline
-        $selection = Read-Host
-
-        if ($selection -eq "R" -or $selection -eq "r") {
-            $script:SWLastRefresh = Get-Date
-            continue
-        }
-
-        if ($selection -eq "N" -or $selection -eq "n") {
-            Invoke-NodeManagement -Swis $script:SWConnection
-            continue
-        }
-
-        if ($selection -eq "T" -or $selection -eq "t") {
-            Invoke-TemplateManagement -Swis $script:SWConnection
-            continue
-        }
-
-        if ($selection -eq "A" -or $selection -eq "a") {
-            Invoke-AlertManagement -Swis $script:SWConnection
-            continue
-        }
-
-        if ($selection -eq "M" -or $selection -eq "m") {
-            Invoke-MaintenanceManagement -Swis $script:SWConnection
-            continue
-        }
-
-        switch ($selection) {
-            "1" {
-                Invoke-NodeManagement -Swis $script:SWConnection
-            }
-
-            "2" {
-                Invoke-TemplateManagement -Swis $script:SWConnection
-            }
-
-            "3" {
-                Invoke-ApplicationManagement -Swis $script:SWConnection
-            }
-
-            "4" {
-                Invoke-AlertManagement -Swis $script:SWConnection
-            }
-
-            "5" {
-                Invoke-MaintenanceManagement -Swis $script:SWConnection
-            }
-
-            "6" {
-                Invoke-DashboardView -Swis $script:SWConnection
-            }
-
-            "7" {
-                Invoke-QuickActions -Swis $script:SWConnection
-            }
-
-            "8" {
-                Invoke-ExportMenu -Swis $script:SWConnection
-            }
-
-            "9" {
-                Write-SWLog "Current connection: $script:SWServer" -Level INFO
-                Write-SWLog "To reconnect to a different server, restart the script" -Level INFO
-                Read-Host "Press Enter to continue"
-            }
-
-            "0" {
-                Clear-Host
-                Write-SWLog "Goodbye!" -Level SUCCESS
-                break mainMenuLoop
-            }
-
-            default {
-                Write-SWLog "Invalid selection. Please try again." -Level WARNING
-                Start-Sleep -Seconds 1
-            }
-        }
-    } while ($true)
-
 } finally {
+    # Restore original certificate validation callback
+    try {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $origCertCallback
+        Write-SWLog "Restored certificate validation callback." -Level DEBUG
+    } catch {}
     if ($script:SWConnection) {
         if (Get-Command Disconnect-Swis -ErrorAction SilentlyContinue) {
             Disconnect-Swis -SwisConnection $script:SWConnection -ErrorAction SilentlyContinue

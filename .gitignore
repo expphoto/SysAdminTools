@@ -17,3 +17,15 @@ Thumbs.db
 # Assistant scratch space
 .code/
 
+# Logs
+*.log
+
+# Audit outputs / exports
+*.csv
+
+# Secret files
+*-credentials.txt
+*credentials*.txt
+*.secrets
+*.secret
+*.env
