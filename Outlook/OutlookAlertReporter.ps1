@@ -119,6 +119,8 @@ $script:UnresolvedStateKeywords = @(
     'failing','impacting users','customer impact','escalated','urgent action required'
 )
 
+$script:NonServerNames = @('Unknown','Campaign','Marketing','Notification')
+
 $script:ServerNameRegexes = @(
     '(?i)\b(?:srv|server|host|node|dc|sql|exch|rdp|fs|web)[-_ ]?([a-z0-9\-]{2,})\b',
     '(?i)\b([a-z0-9\-]{3,})\.(?:local|lan|corp|internal|example\.com)\b',
@@ -1131,6 +1133,9 @@ function Extract-EmailInfo {
             ActionableScore = 0
             ActionableReason = ""
             IsActionable = $false
+            IsUnread = $false
+            LastVerb = "None"
+            WasRepliedOrForwarded = $false
             IsDuplicate = $false
             DuplicateGroupId = ""
             UseCase = ""
@@ -1144,10 +1149,22 @@ function Extract-EmailInfo {
             $propertyAccessor = $Item.PropertyAccessor
             $script:ComObjectsToCleanup += $propertyAccessor
             $emailInfo.InternetMessageId = $propertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x1035001E")
+
+            # PR_LAST_VERB_EXECUTED: 102=Reply, 103=ReplyAll, 104=Forward
+            $lastVerbValue = $propertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x10810003")
+            $emailInfo.LastVerb = Get-LastVerbDescription -LastVerbValue $lastVerbValue
+            $emailInfo.WasRepliedOrForwarded = ($lastVerbValue -in @(102, 103, 104))
         }
         catch {
             # Internet Message ID not available
             $emailInfo.InternetMessageId = ""
+        }
+
+        try {
+            $emailInfo.IsUnread = [bool]$Item.UnRead
+        }
+        catch {
+            $emailInfo.IsUnread = $false
         }
         
         # Extract server name from subject and body
@@ -1361,6 +1378,19 @@ function Get-Actionability {
         $reasonParts += 'Duplicate of another message'
     }
 
+    if ($Email.IsUnread) {
+        $score += 10
+        $reasonParts += 'Unread (not yet processed)'
+    } else {
+        $score -= 15
+        $reasonParts += 'Already marked read'
+    }
+
+    if ($Email.WasRepliedOrForwarded) {
+        $score -= 30
+        $reasonParts += "Thread already handled ($($Email.LastVerb))"
+    }
+
     # Boost recent alerts to make triage queue more current.
     if ($NewestReceivedTime -and $Email.ReceivedTime) {
         $ageHours = [Math]::Abs((New-TimeSpan -Start $Email.ReceivedTime -End $NewestReceivedTime).TotalHours)
@@ -1376,7 +1406,7 @@ function Get-Actionability {
     if ($score -lt 0) { $score = 0 }
     if ($score -gt 100) { $score = 100 }
 
-    $isActionable = ($score -ge 40 -and $Email.ResolutionState -ne 'LikelyResolved')
+    $isActionable = ($score -ge 45 -and $Email.ResolutionState -ne 'LikelyResolved' -and -not $Email.WasRepliedOrForwarded)
     if ($isActionable) {
         $reasonParts += 'Queue for action now'
     }
@@ -1393,6 +1423,17 @@ function ConvertTo-HtmlSafe {
 
     if ($null -eq $Value) { return '' }
     return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+}
+
+function Get-LastVerbDescription {
+    param([int]$LastVerbValue)
+
+    switch ($LastVerbValue) {
+        102 { return 'Reply' }
+        103 { return 'ReplyAll' }
+        104 { return 'Forward' }
+        default { return 'None' }
+    }
 }
 
 function Extract-ServerName {
@@ -1423,11 +1464,6 @@ function Extract-ServerName {
     
     if ($Subject -match '(?i)notification|alert|update') {
         return "Notification"
-    }
-    
-    # Try to extract sender domain as fallback
-    if ($Body -match '(?i)from[:\s]+.*?@([a-z0-9\-\.]+\.[a-z]{2,})') {
-        return $matches[1].ToLower()
     }
     
     return "Unknown"
@@ -1744,13 +1780,20 @@ function Show-ConsoleSummary {
         Write-Host "  $($subject.Count)x - $displayName"
     }
     
-    # Top 10 servers
+    # Top 10 affected hosts/servers
     Write-Host ""
-    Write-Host "Top 10 Servers by Frequency:" -ForegroundColor Yellow
-    $topServers = $allEmails | Group-Object ServerName | Sort-Object Count -Descending | Select-Object -First 10
-    foreach ($server in $topServers) {
-        $displayName = if ([string]::IsNullOrWhiteSpace($server.Name)) { "(No Server)" } else { $server.Name }
-        Write-Host "  $($server.Count)x - $displayName"
+    Write-Host "Top 10 Affected Hosts/Servers:" -ForegroundColor Yellow
+    $topServers = $allEmails |
+        Where-Object { $_.ServerName -and ($_.ServerName -notin $script:NonServerNames) } |
+        Group-Object ServerName |
+        Sort-Object Count -Descending |
+        Select-Object -First 10
+    if (-not $topServers -or $topServers.Count -eq 0) {
+        Write-Host "  No concrete host/server names detected." -ForegroundColor DarkYellow
+    } else {
+        foreach ($server in $topServers) {
+            Write-Host "  $($server.Count)x - $($server.Name)"
+        }
     }
     
     # Owners distribution
@@ -1794,7 +1837,8 @@ function Show-ConsoleSummary {
             Write-Host "    Subject: $($email.Subject)"
             Write-Host "    Why: $($email.ActionableReason)"
             if ($email.BodySnippet) { Write-Host "    Snippet: $($email.BodySnippet)" }
-            Write-Host "    Sender: $sender | EntryID: $($email.EntryID) | InternetMessageId: $($email.InternetMessageId)"
+            $readState = if ($email.IsUnread) { 'Unread' } else { 'Read' }
+            Write-Host "    Sender: $sender | ReadState: $readState | LastVerb: $($email.LastVerb) | EntryID: $($email.EntryID)"
         }
     }
     
@@ -1909,6 +1953,9 @@ function Convert-EmailsForCsv {
                 IsActionable = if ($_.IsActionable -ne $null) { $_.IsActionable } else { $false }
                 ActionableReason = if ($_.ActionableReason) { $_.ActionableReason } else { "" }
                 BodySnippet = if ($_.BodySnippet) { $_.BodySnippet } else { "" }
+                IsUnread = if ($_.IsUnread -ne $null) { $_.IsUnread } else { $false }
+                LastVerb = if ($_.LastVerb) { $_.LastVerb } else { "None" }
+                WasRepliedOrForwarded = if ($_.WasRepliedOrForwarded -ne $null) { $_.WasRepliedOrForwarded } else { $false }
                 EntryID = if ($_.EntryID) { $_.EntryID } else { "" }
                 InternetMessageId = if ($_.InternetMessageId) { $_.InternetMessageId } else { "" }
                 FolderPath = if ($_.FolderPath) { $_.FolderPath } else { "" }
@@ -1969,8 +2016,10 @@ function Export-HtmlReport {
         .priority-high .stat-number { color: #e74c3c; }
         .priority-low { background-color: #f0f9f4; border-left: 4px solid #27ae60; }
         .priority-low .stat-number { color: #27ae60; }
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        .table-wrap { width: 100%; overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; table-layout: fixed; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; }
+        td { word-break: break-word; overflow-wrap: anywhere; }
         th { background-color: #34495e; color: white; font-weight: 600; }
         tr:nth-child(even) { background-color: #f9f9f9; }
         tr:hover { background-color: #f5f5f5; }
@@ -1985,6 +2034,8 @@ function Export-HtmlReport {
         .expandable-details td { font-size: 0.9em; }
         .expand-icon { margin-right: 8px; transition: transform 0.2s; }
         .expanded .expand-icon { transform: rotate(90deg); }
+        .id-col { max-width: 220px; font-family: Consolas, monospace; font-size: 0.85em; }
+        .snippet-col { max-width: 420px; }
         .footer { margin-top: 30px; text-align: center; color: #7f8c8d; font-size: 0.9em; border-top: 1px solid #ddd; padding-top: 15px; }
     </style>
     <script>
@@ -2040,8 +2091,9 @@ function Export-HtmlReport {
     $html += @"
         <div class="section">
             <h2>Actionable Queue (What To Do Now)</h2>
+            <div class="table-wrap">
             <table>
-                <thead><tr><th>Received</th><th>Subject</th><th>Sender</th><th>Server</th><th>Owner</th><th>Score</th><th>Resolution</th><th>Reason</th><th>Snippet</th><th>EntryID</th><th>InternetMessageId</th></tr></thead>
+                <thead><tr><th>Received</th><th>Score</th><th>Read</th><th>Last Action</th><th>Subject</th><th>Owner</th><th>Server</th><th>Reason</th><th>Snippet</th><th>MessageId</th></tr></thead>
                 <tbody>
 "@
 
@@ -2055,17 +2107,21 @@ function Export-HtmlReport {
             $safeReason = ConvertTo-HtmlSafe -Value $email.ActionableReason
             $safeResolution = ConvertTo-HtmlSafe -Value $email.ResolutionState
             $safeSnippet = ConvertTo-HtmlSafe -Value $email.BodySnippet
-            $safeEntryId = ConvertTo-HtmlSafe -Value $email.EntryID
-            $safeInternetMessageId = ConvertTo-HtmlSafe -Value $email.InternetMessageId
-            $html += "<tr><td>$timeStr</td><td>$safeSubject</td><td>$safeSender</td><td>$safeServer</td><td>$safeOwner</td><td>$($email.ActionableScore)</td><td>$safeResolution</td><td>$safeReason</td><td>$safeSnippet</td><td>$safeEntryId</td><td>$safeInternetMessageId</td></tr>"
+            $readState = if ($email.IsUnread) { 'Unread' } else { 'Read' }
+            $safeReadState = ConvertTo-HtmlSafe -Value $readState
+            $safeLastVerb = ConvertTo-HtmlSafe -Value $email.LastVerb
+            $primaryId = if (-not [string]::IsNullOrWhiteSpace($email.InternetMessageId)) { $email.InternetMessageId } else { $email.EntryID }
+            $safePrimaryId = ConvertTo-HtmlSafe -Value $primaryId
+            $html += "<tr><td>$timeStr</td><td>$($email.ActionableScore)</td><td>$safeReadState</td><td>$safeLastVerb</td><td>$safeSubject</td><td>$safeOwner</td><td>$safeServer</td><td>$safeReason</td><td class=""snippet-col"">$safeSnippet</td><td class=""id-col"">$safePrimaryId</td></tr>"
         }
     } else {
-        $html += "<tr><td colspan=""11""><em>No high-confidence actionable items identified.</em></td></tr>"
+        $html += "<tr><td colspan=""10""><em>No high-confidence actionable items identified.</em></td></tr>"
     }
 
     $html += @"
                 </tbody>
             </table>
+            </div>
         </div>
 "@
 
@@ -2108,13 +2164,20 @@ function Export-HtmlReport {
         </div>
         
         <div class="section">
-            <h2>Top 10 Servers by Frequency</h2>
+            <h2>Top 10 Affected Hosts/Servers</h2>
             <div class="top-list">
 "@
 
     # Add top servers with expandable details
-    $topServers = $allEmails | Group-Object ServerName | Sort-Object Count -Descending | Select-Object -First 10
+    $topServers = $allEmails |
+        Where-Object { $_.ServerName -and ($_.ServerName -notin $script:NonServerNames) } |
+        Group-Object ServerName |
+        Sort-Object Count -Descending |
+        Select-Object -First 10
     $serverIndex = 0
+    if (-not $topServers -or $topServers.Count -eq 0) {
+        $html += "<div class=""top-item""><span>No concrete host/server names detected.</span><span class=""count-badge"">0</span></div>"
+    }
     foreach ($server in $topServers) {
         $serverIndex++
         $safeServerName = if ($server.Name) { $server.Name -replace '<', '<' -replace '>', '>' -replace '"', '"' -replace '&', '&' } else { "Unknown" }
