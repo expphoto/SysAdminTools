@@ -109,6 +109,16 @@ $script:LowHangingFruitKeywords = @(
     'improved','optimized','enhanced','upgraded','performance improved','faster','efficient'
 )
 
+$script:ResolvedStateKeywords = @(
+    'resolved','auto-resolved','autoresolved','cleared','recovered','restored','fixed','closed','issue resolved',
+    'service restored','back to normal','returned to normal','healthy again','recovered automatically'
+)
+
+$script:UnresolvedStateKeywords = @(
+    'still failing','ongoing','investigating','not resolved','unresolved','degraded','down','offline','failed',
+    'failing','impacting users','customer impact','escalated','urgent action required'
+)
+
 $script:ServerNameRegexes = @(
     '(?i)\b(?:srv|server|host|node|dc|sql|exch|rdp|fs|web)[-_ ]?([a-z0-9\-]{2,})\b',
     '(?i)\b([a-z0-9\-]{3,})\.(?:local|lan|corp|internal|example\.com)\b',
@@ -1110,12 +1120,17 @@ function Extract-EmailInfo {
             NormalizedSubject = Get-NormalizedSubject -Subject $(if ($Item.Subject) { $Item.Subject } else { "" })
             Signature = $null
             Body = Get-EmailBodyPreview -Item $Item
+            BodySnippet = ""
             EntryID = if ($Item.EntryID) { $Item.EntryID } else { "" }
             FolderPath = $FolderPath
             InternetMessageId = $null
             ServerName = $null
             HighPriority = $false
             LowHangingFruit = $false
+            ResolutionState = "Unknown"
+            ActionableScore = 0
+            ActionableReason = ""
+            IsActionable = $false
             IsDuplicate = $false
             DuplicateGroupId = ""
             UseCase = ""
@@ -1140,6 +1155,7 @@ function Extract-EmailInfo {
 
         # Build normalized signature for correlation
         $emailInfo.Signature = Get-AlertSignature -Subject $emailInfo.NormalizedSubject
+        $emailInfo.BodySnippet = Get-TriageSnippet -Body $emailInfo.Body
         
         return $emailInfo
     }
@@ -1247,6 +1263,138 @@ function Get-EmailBodyPreview {
     }
 }
 
+function Get-TriageSnippet {
+    param(
+        [string]$Body,
+        [int]$MaxLength = 220
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Body)) {
+        return ""
+    }
+
+    $snippet = $Body -replace '\s+', ' '
+    $snippet = $snippet.Trim()
+    if ($snippet.Length -le $MaxLength) {
+        return $snippet
+    }
+
+    return ($snippet.Substring(0, $MaxLength).TrimEnd() + '...')
+}
+
+function Get-ResolutionState {
+    param(
+        [string]$Subject,
+        [string]$Body
+    )
+
+    $text = "$Subject $Body"
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return 'Unknown'
+    }
+
+    $lowerText = $text.ToLowerInvariant()
+    $resolvedMatch = $false
+    $unresolvedMatch = $false
+
+    foreach ($keyword in $script:ResolvedStateKeywords) {
+        if ($lowerText.Contains($keyword.ToLowerInvariant())) {
+            $resolvedMatch = $true
+            break
+        }
+    }
+
+    foreach ($keyword in $script:UnresolvedStateKeywords) {
+        if ($lowerText.Contains($keyword.ToLowerInvariant())) {
+            $unresolvedMatch = $true
+            break
+        }
+    }
+
+    if ($unresolvedMatch -and -not $resolvedMatch) { return 'LikelyUnresolved' }
+    if ($resolvedMatch -and -not $unresolvedMatch) { return 'LikelyResolved' }
+    if ($resolvedMatch -and $unresolvedMatch) { return 'MixedSignals' }
+    return 'Unknown'
+}
+
+function Get-Actionability {
+    param(
+        [object]$Email,
+        [datetime]$NewestReceivedTime
+    )
+
+    $score = 0
+    $reasonParts = @()
+
+    if ($Email.HighPriority) {
+        $score += 50
+        $reasonParts += 'High-priority keyword hit'
+    }
+
+    if ($Email.LowHangingFruit) {
+        $score -= 15
+        $reasonParts += 'Low-hanging/informational signal'
+    }
+
+    switch ($Email.ResolutionState) {
+        'LikelyUnresolved' {
+            $score += 20
+            $reasonParts += 'Unresolved wording detected'
+        }
+        'LikelyResolved' {
+            $score -= 35
+            $reasonParts += 'Resolved/auto-resolved wording detected'
+        }
+        'MixedSignals' {
+            $score += 5
+            $reasonParts += 'Mixed resolved/unresolved signals'
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Email.ServerName) -and $Email.ServerName -ne 'Unknown') {
+        $score += 5
+        $reasonParts += "Server identified: $($Email.ServerName)"
+    }
+
+    if ($Email.IsDuplicate) {
+        $score -= 20
+        $reasonParts += 'Duplicate of another message'
+    }
+
+    # Boost recent alerts to make triage queue more current.
+    if ($NewestReceivedTime -and $Email.ReceivedTime) {
+        $ageHours = [Math]::Abs((New-TimeSpan -Start $Email.ReceivedTime -End $NewestReceivedTime).TotalHours)
+        if ($ageHours -le 2) {
+            $score += 15
+            $reasonParts += 'Very recent (<=2h)'
+        } elseif ($ageHours -le 12) {
+            $score += 8
+            $reasonParts += 'Recent (<=12h)'
+        }
+    }
+
+    if ($score -lt 0) { $score = 0 }
+    if ($score -gt 100) { $score = 100 }
+
+    $isActionable = ($score -ge 40 -and $Email.ResolutionState -ne 'LikelyResolved')
+    if ($isActionable) {
+        $reasonParts += 'Queue for action now'
+    }
+
+    return [PSCustomObject]@{
+        Score = $score
+        Reason = ($reasonParts -join '; ')
+        IsActionable = $isActionable
+    }
+}
+
+function ConvertTo-HtmlSafe {
+    param([string]$Value)
+
+    if ($null -eq $Value) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+}
+
 function Extract-ServerName {
     param(
         [string]$Subject,
@@ -1316,6 +1464,7 @@ function Process-EmailData {
         
         $email.HighPriority = Test-KeywordMatch -Text $searchText -Keywords $Config.HighPriorityKeywords -EmailSubject $email.Subject -Verbose:$keywordDebugMode
         $email.LowHangingFruit = Test-KeywordMatch -Text $searchText -Keywords $Config.LowHangingFruitKeywords -EmailSubject $email.Subject -Verbose:$keywordDebugMode
+        $email.ResolutionState = Get-ResolutionState -Subject $email.Subject -Body $email.Body
         $email.IsDuplicate = $false
         $email.DuplicateGroupId = ""
         
@@ -1324,13 +1473,11 @@ function Process-EmailData {
         
         # Determine owner/team (Development, Engineering, Admins, Networking, Other)
         $email.OwnerTeam = Determine-Owner -Email $email
-
-        # Apply rule-based classification if rules are loaded
-        $null = Apply-UseCaseRules -Email $email
         
         if ($keywordDebugMode) {
             Write-Host "  High Priority: $($email.HighPriority)" -ForegroundColor $(if ($email.HighPriority) { "Red" } else { "Gray" })
             Write-Host "  Low-Hanging Fruit: $($email.LowHangingFruit)" -ForegroundColor $(if ($email.LowHangingFruit) { "Green" } else { "Gray" })
+            Write-Host "  Resolution State: $($email.ResolutionState)" -ForegroundColor Gray
         }
     }
     
@@ -1362,6 +1509,17 @@ function Process-EmailData {
     $duplicateCount = ($EmailData | Where-Object { $_.IsDuplicate }).Count
     $uniqueCount = $EmailData.Count - $duplicateCount
     Write-Verbose "Found $uniqueCount unique emails and $duplicateCount duplicates"
+
+    $newestReceivedTime = ($EmailData | Sort-Object ReceivedTime -Descending | Select-Object -First 1).ReceivedTime
+    foreach ($email in $EmailData) {
+        $actionability = Get-Actionability -Email $email -NewestReceivedTime $newestReceivedTime
+        $email.ActionableScore = $actionability.Score
+        $email.ActionableReason = $actionability.Reason
+        $email.IsActionable = $actionability.IsActionable
+        if (-not $email.BodySnippet) {
+            $email.BodySnippet = Get-TriageSnippet -Body $email.Body
+        }
+    }
     
     # Correlate alerts into incidents (use signature/use case/server + time window)
     $incidents = Invoke-Correlation -Emails ($EmailData | Sort-Object ReceivedTime) -WindowMinutes $Config.CorrelationWindowMinutes
@@ -1618,6 +1776,27 @@ function Show-ConsoleSummary {
             Write-Host "  [$($inc.FirstSeen.ToString('MM-dd HH:mm')) → $($inc.LastSeen.ToString('MM-dd HH:mm'))] $($inc.UseCase) | $($inc.ServerName) | $($inc.Signature) | x$($inc.Count) | $p"
         }
     }
+
+    Write-Host ""
+    Write-Host "Top Actionable Queue (triage now):" -ForegroundColor Yellow
+    $actionableQueue = $uniqueEmails |
+        Where-Object { $_.IsActionable } |
+        Sort-Object @{ Expression = 'ActionableScore'; Descending = $true }, @{ Expression = 'ReceivedTime'; Descending = $true } |
+        Select-Object -First 12
+
+    if (-not $actionableQueue -or $actionableQueue.Count -eq 0) {
+        Write-Host "  No strongly actionable emails identified from current rules/signals."
+    } else {
+        foreach ($email in $actionableQueue) {
+            $timeStr = $email.ReceivedTime.ToString('yyyy-MM-dd HH:mm')
+            $sender = if ($email.SenderEmailAddress) { $email.SenderEmailAddress } else { 'Unknown' }
+            Write-Host "  [$timeStr] Score=$($email.ActionableScore) Owner=$($email.OwnerTeam) Server=$($email.ServerName)"
+            Write-Host "    Subject: $($email.Subject)"
+            Write-Host "    Why: $($email.ActionableReason)"
+            if ($email.BodySnippet) { Write-Host "    Snippet: $($email.BodySnippet)" }
+            Write-Host "    Sender: $sender | EntryID: $($email.EntryID) | InternetMessageId: $($email.InternetMessageId)"
+        }
+    }
     
     # Alerts per day
     Write-Host ""
@@ -1657,6 +1836,7 @@ function Export-CsvReports {
     $uniqueCsvPath = Join-Path $Config.OutputFolder "alerts_unique.csv"
     $duplicatesCsvPath = Join-Path $Config.OutputFolder "alerts_duplicates.csv"
     $incidentsCsvPath = Join-Path $Config.OutputFolder "alerts_incidents.csv"
+    $actionableCsvPath = Join-Path $Config.OutputFolder "alerts_actionable.csv"
     
             $csvAllEmails | Export-Csv -Path $allCsvPath -NoTypeInformation -Encoding UTF8
             $csvUniqueEmails | Export-Csv -Path $uniqueCsvPath -NoTypeInformation -Encoding UTF8
@@ -1680,6 +1860,13 @@ function Export-CsvReports {
     if ($incidentRows) {
         $incidentRows | Export-Csv -Path $incidentsCsvPath -NoTypeInformation -Encoding UTF8
     }
+
+    $actionableRows = $csvUniqueEmails |
+        Where-Object { $_.IsActionable } |
+        Sort-Object @{ Expression = 'ActionableScore'; Descending = $true }, @{ Expression = 'ReceivedTime'; Descending = $true }
+    if ($actionableRows) {
+        $actionableRows | Export-Csv -Path $actionableCsvPath -NoTypeInformation -Encoding UTF8
+    }
     
     $allCount = $csvAllEmails.Count
     $uniqueCount = $csvUniqueEmails.Count 
@@ -1689,6 +1876,7 @@ function Export-CsvReports {
     Write-Host "  Exported: alerts_unique.csv - $uniqueCount rows" -ForegroundColor Green
     Write-Host "  Exported: alerts_duplicates.csv - $duplicateCount rows" -ForegroundColor Green
     Write-Host "  Exported: alerts_incidents.csv - $($incidentRows.Count) rows" -ForegroundColor Green
+    Write-Host "  Exported: alerts_actionable.csv - $($actionableRows.Count) rows" -ForegroundColor Green
 }
 
 function Convert-EmailsForCsv {
@@ -1716,6 +1904,11 @@ function Convert-EmailsForCsv {
                 Category = if ($_.Category) { $_.Category } else { "" }
                 Vendor = if ($_.Vendor) { $_.Vendor } else { "" }
                 OwnerTeam = if ($_.OwnerTeam) { $_.OwnerTeam } else { "Other" }
+                ResolutionState = if ($_.ResolutionState) { $_.ResolutionState } else { "Unknown" }
+                ActionableScore = if ($_.ActionableScore -ne $null) { $_.ActionableScore } else { 0 }
+                IsActionable = if ($_.IsActionable -ne $null) { $_.IsActionable } else { $false }
+                ActionableReason = if ($_.ActionableReason) { $_.ActionableReason } else { "" }
+                BodySnippet = if ($_.BodySnippet) { $_.BodySnippet } else { "" }
                 EntryID = if ($_.EntryID) { $_.EntryID } else { "" }
                 InternetMessageId = if ($_.InternetMessageId) { $_.InternetMessageId } else { "" }
                 FolderPath = if ($_.FolderPath) { $_.FolderPath } else { "" }
@@ -1735,6 +1928,7 @@ function Export-HtmlReport {
     $allEmails = $ProcessedData.AllEmails
     $uniqueEmails = $ProcessedData.UniqueEmails
     $duplicateEmails = $ProcessedData.DuplicateEmails
+    $incidents = if ($ProcessedData.Incidents) { $ProcessedData.Incidents } else { @() }
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     
     # Calculate statistics
@@ -1744,6 +1938,10 @@ function Export-HtmlReport {
     $duplicateRatio = if ($allEmails.Count -gt 0) { [Math]::Round(($duplicateEmails.Count / $allEmails.Count) * 100, 1) } else { 0 }
     
     $filterDesc = if ($Config.FilterType -eq "None") { "No address filter (all emails in scope)" } else { "$($Config.FilterType) = $($Config.FilterAddress)" }
+    $actionableQueue = $uniqueEmails |
+        Where-Object { $_.IsActionable } |
+        Sort-Object @{ Expression = 'ActionableScore'; Descending = $true }, @{ Expression = 'ReceivedTime'; Descending = $true } |
+        Select-Object -First 50
     
     # Build HTML content with simple string concatenation
     $html = @"
@@ -1837,6 +2035,41 @@ function Export-HtmlReport {
             </div>
         </div>
         
+"@
+
+    $html += @"
+        <div class="section">
+            <h2>Actionable Queue (What To Do Now)</h2>
+            <table>
+                <thead><tr><th>Received</th><th>Subject</th><th>Sender</th><th>Server</th><th>Owner</th><th>Score</th><th>Resolution</th><th>Reason</th><th>Snippet</th><th>EntryID</th><th>InternetMessageId</th></tr></thead>
+                <tbody>
+"@
+
+    if ($actionableQueue -and $actionableQueue.Count -gt 0) {
+        foreach ($email in $actionableQueue) {
+            $timeStr = if ($email.ReceivedTime) { $email.ReceivedTime.ToString('yyyy-MM-dd HH:mm') } else { '' }
+            $safeSubject = ConvertTo-HtmlSafe -Value $email.Subject
+            $safeSender = ConvertTo-HtmlSafe -Value $email.SenderEmailAddress
+            $safeServer = ConvertTo-HtmlSafe -Value $email.ServerName
+            $safeOwner = ConvertTo-HtmlSafe -Value $email.OwnerTeam
+            $safeReason = ConvertTo-HtmlSafe -Value $email.ActionableReason
+            $safeResolution = ConvertTo-HtmlSafe -Value $email.ResolutionState
+            $safeSnippet = ConvertTo-HtmlSafe -Value $email.BodySnippet
+            $safeEntryId = ConvertTo-HtmlSafe -Value $email.EntryID
+            $safeInternetMessageId = ConvertTo-HtmlSafe -Value $email.InternetMessageId
+            $html += "<tr><td>$timeStr</td><td>$safeSubject</td><td>$safeSender</td><td>$safeServer</td><td>$safeOwner</td><td>$($email.ActionableScore)</td><td>$safeResolution</td><td>$safeReason</td><td>$safeSnippet</td><td>$safeEntryId</td><td>$safeInternetMessageId</td></tr>"
+        }
+    } else {
+        $html += "<tr><td colspan=""11""><em>No high-confidence actionable items identified.</em></td></tr>"
+    }
+
+    $html += @"
+                </tbody>
+            </table>
+        </div>
+"@
+
+    $html += @"
         <div class="section">
             <h2>Top 10 Subjects by Frequency</h2>
             <div class="top-list">
@@ -2060,6 +2293,7 @@ function Generate-EmptyReport {
         UniqueEmails = @()
         DuplicateEmails = @()
         DuplicateGroups = @{}
+        Incidents = @()
     }
     
     Generate-Reports -ProcessedData $emptyData -Config $Config
