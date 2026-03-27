@@ -587,6 +587,9 @@ function Invoke-WorkloadDetection {
             LogActivityLevel = 'None'
             ActiveSites = @()
             ActiveApplications = @()
+            ApplicationsWithTraffic = @()
+            ApplicationTrafficCounts = @{}
+            TopActiveApplications = @()
         }
 
         if (Get-Command -Name Get-Website -ErrorAction SilentlyContinue) {
@@ -660,18 +663,38 @@ function Invoke-WorkloadDetection {
         # Check app pools that are started
         $runningAppPools = $appPools | Where-Object { $_.Value -eq 'Started' }
 
+        # Map log traffic to applications
+        $appsWithTraffic = New-Object 'System.Collections.Generic.List[string]'
+        $topAppsByTraffic = @()
+        if ($appRequestCounts.Count -gt 0) {
+            # Sort applications by request count
+            $topAppsByTraffic = $appRequestCounts.GetEnumerator() | 
+                Sort-Object Value -Descending | 
+                Select-Object -First 10
+            
+            # Create list of apps with traffic
+            foreach ($appEntry in $topAppsByTraffic) {
+                $appPath = $appEntry.Key
+                $requestCount = $appEntry.Value
+                $appsWithTraffic.Add("$appPath ($requestCount requests)")
+            }
+        }
+
         $iisDetails.ActiveSites = $activeSites
         $iisDetails.ActiveApplications = $activeApps
+        $iisDetails.ApplicationsWithTraffic = $appsWithTraffic
+        $iisDetails.ApplicationTrafficCounts = $appRequestCounts
+        $iisDetails.TopActiveApplications = $topAppsByTraffic
         $iisDetails.RecentLogEntries = $iisActivity
         $iisDetails.LogActivityLevel = if ($iisActivity -gt 1000) { 'High' } elseif ($iisActivity -gt 100) { 'Moderate' } elseif ($iisActivity -gt 0) { 'Low' } else { 'None' }
 
-        $confidence = if ($iisActivity -gt 100 -or $activeSites.Count -gt 0) { 'High' } else { 'Medium' }
-        $criticality = if ($iisActivity -gt 1000 -or $activeSites.Count -gt 2) { 'HIGH' } elseif ($iisActivity -gt 100 -or $activeSites.Count -gt 0) { 'HIGH' } else { 'MEDIUM' }
+        $confidence = if ($appsWithTraffic.Count -gt 0) { 'High' } elseif ($iisActivity -gt 100 -or $activeSites.Count -gt 0) { 'High' } else { 'Medium' }
+        $criticality = if ($appsWithTraffic.Count -gt 5 -or $iisActivity -gt 1000) { 'HIGH' } elseif ($appsWithTraffic.Count -gt 0 -or $iisActivity -gt 100) { 'MEDIUM' } else { 'LOW' }
 
         $script:ActiveWorkloads.Add([PSCustomObject]@{
             Type = 'Web Server (IIS)'
             Confidence = $confidence
-            Evidence = "$($sites.Count) sites ($($activeSites.Count) started), $($apps.Count) applications ($($activeApps.Count) active in started sites), $($appPools.Count) app pools ($($runningAppPools.Count) running), sampled $iisActivity recent log entries"
+            Evidence = "$($sites.Count) sites ($($activeSites.Count) started), $($apps.Count) total apps ($($appsWithTraffic.Count) with HTTP traffic), $($appPools.Count) app pools ($($runningAppPools.Count) running), $iisActivity log entries"
             Criticality = $criticality
             TestScenario = 'Test website access, application pools, SSL certificates'
             Details = $iisDetails
@@ -1181,20 +1204,34 @@ function Export-MarkdownReport {
                 $details = $workload.Details
                 $md.Add("  - Test all published websites")
                 $md.Add("    - Started Sites to Test: $(($details.ActiveSites | Select-Object -First 5) -join ', ')")
-                if ($details.ActiveSites.Count -gt 5) {
-                    $md.Add("    - *... and $($details.ActiveSites.Count - 5) more started sites*")
+                if (@($details.ActiveSites).Count -gt 5) {
+                    $md.Add("    - *... and $(@($details.ActiveSites).Count - 5) more started sites*")
                 }
                 
-                $stoppedSites = $details.TotalSites - $details.ActiveSites.Count
+                $stoppedSites = $details.TotalSites - @($details.ActiveSites).Count
                 if ($stoppedSites -gt 0) {
                     $md.Add("    - **Note:** $stoppedSites site(s) are not started - verify if they should be")
                 }
                 
+                # Show applications with actual HTTP traffic
+                if ($details.ApplicationsWithTraffic.Count -gt 0) {
+                    $md.Add("  - **Applications with HTTP Traffic (from log analysis):**")
+                    foreach ($appTraffic in $details.ApplicationsWithTraffic | Select-Object -First 10) {
+                        $md.Add("    - $appTraffic")
+                    }
+                    if ($details.ApplicationsWithTraffic.Count -gt 10) {
+                        $remaining = $details.ApplicationsWithTraffic.Count - 10
+                        $md.Add("    - *... and $remaining more applications with traffic*")
+                    }
+                } else {
+                    $md.Add("  - **Warning:** No HTTP traffic detected in sampled logs - verify sites are serving requests")
+                }
+                
                 $md.Add("  - Verify SSL certificates are valid")
                 $md.Add("  - Check application pool health and auto-restart settings")
-                $md.Add("    - App Pools: $($details.TotalAppPools) total, $(($details.AppPools | Where-Object { $_.Value -eq 'Started' }).Count) running")
-                if ($details.ActiveApplications.Count -gt 0) {
-                    $md.Add("    - Active Applications: $(($details.ActiveApplications | Select-Object -First 5) -join ', ')")
+                $md.Add("    - App Pools: $($details.TotalAppPools) total, $(@($details.AppPools | Where-Object { $_.Value -eq 'Started' }).Count) running")
+                if (@($details.ActiveApplications).Count -gt 0) {
+                    $md.Add("    - Total Applications in Started Sites: $(@($details.ActiveApplications).Count)")
                 }
                 if ($details.RecentLogEntries -eq 0) {
                     $md.Add("  - **WARNING:** No recent IIS log activity - verify sites are serving traffic")
@@ -1658,21 +1695,32 @@ try {
     $webWorkload = $script:ActiveWorkloads | Where-Object { $_.Type -eq 'Web Server (IIS)' }
     if ($webWorkload -and $webWorkload.Details) {
         $details = $webWorkload.Details
-        $runningPools = ($details.AppPools | Where-Object { $_.Value -eq 'Started' }).Count
-        Write-Host "Web Server: $($details.TotalSites) sites ($($details.ActiveSites.Count) started), $($details.TotalApplications) applications, $($details.TotalAppPools) app pools ($runningPools running)" -ForegroundColor White
+        $runningPools = @($details.AppPools | Where-Object { $_.Value -eq 'Started' }).Count
+        Write-Host "Web Server: $($details.TotalSites) sites ($(@($details.ActiveSites).Count) started), $($details.TotalApplications) total apps, $(@($details.ApplicationsWithTraffic).Count) with HTTP traffic, $($details.TotalAppPools) app pools ($runningPools running)" -ForegroundColor White
         Write-Host "  Recent Log Entries: $($details.RecentLogEntries), Activity Level: $($details.LogActivityLevel)" -ForegroundColor Gray
         
         if ($details.RecentLogEntries -eq 0) {
             Write-Host "  WARNING: No recent IIS log activity detected" -ForegroundColor Yellow
         }
         
+        # Show top applications with traffic
+        if ($details.ApplicationsWithTraffic.Count -gt 0) {
+            Write-Host "  Apps with Traffic:" -ForegroundColor Gray
+            $details.ApplicationsWithTraffic | Select-Object -First 5 | ForEach-Object {
+                Write-Host "    $_" -ForegroundColor Gray
+            }
+            if ($details.ApplicationsWithTraffic.Count -gt 5) {
+                Write-Host "    ... and $(@($details.ApplicationsWithTraffic).Count - 5) more" -ForegroundColor Gray
+            }
+        }
+        
         # Show started sites
-        if ($details.ActiveSites.Count -gt 0) {
+        if (@($details.ActiveSites).Count -gt 0) {
             Write-Host "  Started Sites: $(($details.ActiveSites | Select-Object -First 5) -join ', ')" -ForegroundColor Gray
         }
         
         # Show stopped sites warning
-        $stoppedSites = $details.TotalSites - $details.ActiveSites.Count
+        $stoppedSites = $details.TotalSites - @($details.ActiveSites).Count
         if ($stoppedSites -gt 0) {
             Write-Host "  WARNING: $stoppedSites site(s) are not started" -ForegroundColor Yellow
         }
