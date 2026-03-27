@@ -1300,7 +1300,17 @@ function Export-MarkdownReport {
         $md.Add("| Site/Application | Application Pool | Virtual Path | Physical Path |")
         $md.Add("|------------------|------------------|--------------|---------------|")
         foreach ($app in @($details.Applications) | Select-Object -First 10) {
-            $siteName = if ($app.SiteName) { $app.SiteName } else { "Unknown" }
+            # Extract site name from ItemXPath if SiteName property doesn't exist
+            $siteName = "Unknown"
+            if ($app.PSObject.Properties['SiteName']) {
+                $siteName = $app.SiteName
+            } elseif ($app.PSObject.Properties['ItemXPath'] -and $app.ItemXPath) {
+                try {
+                    $siteName = $app.ItemXPath.Split('/')[1].Split('=')[1].Trim([char]39, [char]34)
+                } catch {
+                    $siteName = "Unknown"
+                }
+            }
             $appPath = if ($app.Path) { $app.Path } else { "/" }
             $siteApp = "$siteName$appPath"
             $appPool = if ($app.ApplicationPool) { $app.ApplicationPool } else { "DefaultAppPool" }
