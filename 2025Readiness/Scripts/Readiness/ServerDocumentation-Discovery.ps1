@@ -355,8 +355,8 @@ function Invoke-NetworkAnalysis {
             foreach ($line in $netstat) {
                 if ($line -match ':(\d+)\s+.*\s+(\d+)$') {
                     $port = $Matches[1]
-                    $pid = $Matches[2]
-                    $process = Get-Process -Id $pid -ErrorAction SilentlyContinue
+                    $processId = $Matches[2]
+                    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
                     $listeningPorts.Add([PSCustomObject]@{
                         Port = $port
                         Process = if ($process) { $process.Name } else { 'Unknown' }
@@ -474,9 +474,9 @@ function Invoke-WorkloadDetection {
 
         $activeShares = New-Object 'System.Collections.Generic.List[string]'
         $uniqueShareUsers = New-Object 'System.Collections.Generic.List[string]'
-        foreach ($event in $shareAccessEvents) {
+        foreach ($evt in $shareAccessEvents) {
             try {
-                $xml = [xml]$event.ToXml()
+                $xml = [xml]$evt.ToXml()
                 $shareName = ($xml.Event.EventData.Data | Where-Object { $_.Name -eq 'ShareName' }).'#text'
                 $userName = ($xml.Event.EventData.Data | Where-Object { $_.Name -eq 'SubjectUserName' }).'#text'
                 
@@ -828,9 +828,9 @@ ORDER BY ActiveConnections DESC, SizeMB DESC
         $totalPrintJobs = $printEvents.Count
         $activePrinters = New-Object 'System.Collections.Generic.List[string]'
         
-        foreach ($event in $printEvents) {
+        foreach ($evt in $printEvents) {
             try {
-                $xml = [xml]$event.ToXml()
+                $xml = [xml]$evt.ToXml()
                 $printerName = ($xml.Event.EventData.Data | Where-Object { $_.Name -eq 'Param4' }).'#text'
                 if ($printerName -and $activePrinters -notcontains $printerName) {
                     $activePrinters.Add($printerName)
