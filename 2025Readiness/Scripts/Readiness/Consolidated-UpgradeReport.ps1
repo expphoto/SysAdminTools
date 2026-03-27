@@ -1,40 +1,91 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Consolidates server discovery reports into a single upgrade readiness summary.
+    Consolidates server discovery and readiness reports per server and creates master summary.
 
 .DESCRIPTION
-    This script combines outputs from ServerDocumentation-Discovery.ps1 and analyzes
-    all generated .md and .csv files to create a master upgrade report with:
-    - Executive summary of all servers
-    - Criticality ranking across environment
-    - Workload consolidation and prioritization
-    - Upgrade recommendations and risk assessment
-    - Grouped test scenarios by workload type
+    This script combines outputs from:
+    - ServerDocumentation-Discovery.ps1 (server analysis)
+    - Readiness-Assessment.ps1 (if it exists, upgrade readiness data)
+    
+    For each server, it creates a consolidated report combining both data sources.
+    Also creates a master summary report across all servers.
+
+    Files are matched by server name extracted from filenames:
+    - ServerDocumentation_SERVERNAME_*.md
+    - Readiness_SERVERNAME_*.md (optional)
 
 .PARAMETER InputDirectory
-    Directory containing discovery outputs (defaults to 2025Readiness folder)
+    Directory containing discovery and readiness outputs.
+    If not specified, will prompt for folder selection.
 
 .PARAMETER OutputDirectory
-    Directory for consolidated report output
+    Directory for consolidated report output (default: ConsolidatedReports subfolder)
 
 .PARAMETER DaysBack
     Analysis window in days (default: 14)
 
 .EXAMPLE
     .\Consolidated-UpgradeReport.ps1
-    Generates consolidated report from all discovery outputs
+    Prompts for input folder, then generates consolidated reports
 
 .EXAMPLE
-    .\Consolidated-UpgradeReport.ps1 -InputDirectory "C:\\Reports" -OutputDirectory "C:\\Consolidated"
+    .\Consolidated-UpgradeReport.ps1 -InputDirectory "C:\ServerReports\2025Readiness"
+    Uses specified folder without prompting
+
+.EXAMPLE
+    .\Consolidated-UpgradeReport.ps1 -InputDirectory "C:\Reports" -OutputDirectory "C:\UpgradePlan"
 #>
 
 [CmdletBinding()]
 param(
-    [string]$InputDirectory = (Join-Path $PSScriptRoot ".."),
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot ".." "ConsolidatedReports"),
+    [Parameter(Mandatory=$false)]
+    [string]$InputDirectory,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot "ConsolidatedReports"),
+    
     [int]$DaysBack = 14
 )
+
+# Interactive folder selection if not provided
+if ([string]::IsNullOrWhiteSpace($InputDirectory)) {
+    Write-Host "`n📁 Select Input Directory" -ForegroundColor Cyan
+    Write-Host "This should be the folder containing server discovery reports.`n" -ForegroundColor Gray
+    
+    # Try to use Windows Forms folder browser (if on Windows with GUI)
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+        $folderBrowser.Description = "Select folder containing ServerDocumentation_*.md files"
+        $folderBrowser.RootFolder = [System.Environment+SpecialFolder]::MyComputer
+        
+        # Try to set default to parent of script location
+        $defaultPath = Join-Path $PSScriptRoot ".."
+        if (Test-Path $defaultPath) {
+            $folderBrowser.SelectedPath = (Resolve-Path $defaultPath).Path
+        }
+        
+        $result = $folderBrowser.ShowDialog()
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+            $InputDirectory = $folderBrowser.SelectedPath
+        } else {
+            Write-Warning "No folder selected. Exiting."
+            exit 1
+        }
+    } catch {
+        # Fallback to text input if Windows Forms not available
+        Write-Host "Enter the full path to the folder containing server reports:" -ForegroundColor Yellow
+        $InputDirectory = Read-Host "Folder path"
+        if ([string]::IsNullOrWhiteSpace($InputDirectory) -or -not (Test-Path $InputDirectory)) {
+            Write-Warning "Invalid path. Exiting."
+            exit 1
+        }
+    }
+} elseif (-not (Test-Path $InputDirectory)) {
+    Write-Warning "Input directory not found: $InputDirectory"
+    exit 1
+}
 
 # Initialize
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -46,76 +97,131 @@ if (-not (Test-Path $OutputDirectory)) {
 }
 
 Write-Host "`n╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║       SERVER UPGRADE READINESS - CONSOLIDATED REPORT          ║" -ForegroundColor Cyan
+Write-Host "║     SERVER UPGRADE READINESS - CONSOLIDATED REPORTS           ║" -ForegroundColor Cyan
 Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host "Input Folder: $InputDirectory" -ForegroundColor White
+Write-Host "Output Folder: $OutputDirectory" -ForegroundColor White
 Write-Host "Analysis Period: Last $DaysBack days`n" -ForegroundColor Gray
 
-# Find all discovery outputs
-Write-Progress -Activity "Consolidating Reports" -Status "Scanning for discovery outputs..." -PercentComplete 10
+# Find all discovery and readiness outputs
+Write-Progress -Activity "Scanning" -Status "Looking for server reports..." -PercentComplete 10
 
-$mdFiles = Get-ChildItem -Path $InputDirectory -Filter "ServerDocumentation_*.md" -Recurse -ErrorAction SilentlyContinue
+# Look for various report types
+$discoveryMdFiles = Get-ChildItem -Path $InputDirectory -Filter "ServerDocumentation_*.md" -Recurse -ErrorAction SilentlyContinue
+$readinessMdFiles = Get-ChildItem -Path $InputDirectory -Filter "Readiness_*.md" -Recurse -ErrorAction SilentlyContinue
 $workloadCsvs = Get-ChildItem -Path $InputDirectory -Filter "Workloads_*.csv" -Recurse -ErrorAction SilentlyContinue
 $testPlanCsvs = Get-ChildItem -Path $InputDirectory -Filter "TestPlan_*.csv" -Recurse -ErrorAction SilentlyContinue
 $appCsvs = Get-ChildItem -Path $InputDirectory -Filter "Applications_*.csv" -Recurse -ErrorAction SilentlyContinue
 
-Write-Host "Found:" -ForegroundColor White
-Write-Host "  - $($mdFiles.Count) Server Documentation reports (.md)" -ForegroundColor Gray
-Write-Host "  - $($workloadCsvs.Count) Workload analysis files (.csv)" -ForegroundColor Gray
+# Group files by server name
+$serversWithData = @{}
+
+# Process discovery files
+foreach ($file in $discoveryMdFiles) {
+    # Extract server name from filename: ServerDocumentation_SERVERNAME_2025*.md
+    if ($file.BaseName -match '^ServerDocumentation_([^_]+)_') {
+        $serverName = $Matches[1]
+        if (-not $serversWithData.ContainsKey($serverName)) {
+            $serversWithData[$serverName] = @{
+                DiscoveryFile = $file
+                ReadinessFile = $null
+                WorkloadCsv = $null
+                TestPlanCsv = $null
+                AppCsv = $null
+            }
+        } else {
+            $serversWithData[$serverName].DiscoveryFile = $file
+        }
+    }
+}
+
+# Process readiness files and match to servers
+foreach ($file in $readinessMdFiles) {
+    if ($file.BaseName -match '^Readiness_([^_]+)_') {
+        $serverName = $Matches[1]
+        if (-not $serversWithData.ContainsKey($serverName)) {
+            $serversWithData[$serverName] = @{
+                DiscoveryFile = $null
+                ReadinessFile = $file
+                WorkloadCsv = $null
+                TestPlanCsv = $null
+                AppCsv = $null
+            }
+        } else {
+            $serversWithData[$serverName].ReadinessFile = $file
+        }
+    }
+}
+
+# Process CSVs and match by server name
+foreach ($file in $workloadCsvs) {
+    if ($file.BaseName -match '^Workloads_([^_]+)_') {
+        $serverName = $Matches[1]
+        if (-not $serversWithData.ContainsKey($serverName)) {
+            $serversWithData[$serverName] = @{
+                DiscoveryFile = $null
+                ReadinessFile = $null
+                WorkloadCsv = $file
+                TestPlanCsv = $null
+                AppCsv = $null
+            }
+        } else {
+            $serversWithData[$serverName].WorkloadCsv = $file
+        }
+    }
+}
+
+foreach ($file in $testPlanCsvs) {
+    if ($file.BaseName -match '^TestPlan_([^_]+)_') {
+        $serverName = $Matches[1]
+        if (-not $serversWithData.ContainsKey($serverName)) {
+            $serversWithData[$serverName] = @{
+                DiscoveryFile = $null
+                ReadinessFile = $null
+                WorkloadCsv = $null
+                TestPlanCsv = $file
+                AppCsv = $null
+            }
+        } else {
+            $serversWithData[$serverName].TestPlanCsv = $file
+        }
+    }
+}
+
+foreach ($file in $appCsvs) {
+    if ($file.BaseName -match '^Applications_([^_]+)_') {
+        $serverName = $Matches[1]
+        if (-not $serversWithData.ContainsKey($serverName)) {
+            $serversWithData[$serverName] = @{
+                DiscoveryFile = $null
+                ReadinessFile = $null
+                WorkloadCsv = $null
+                TestPlanCsv = $null
+                AppCsv = $file
+            }
+        } else {
+            $serversWithData[$serverName].AppCsv = $file
+        }
+    }
+}
+
+Write-Host "Found Data For:" -ForegroundColor White
+Write-Host "  - $($discoveryMdFiles.Count) Discovery reports (.md)" -ForegroundColor Gray
+Write-Host "  - $($readinessMdFiles.Count) Readiness reports (.md)" -ForegroundColor Gray
+Write-Host "  - $($workloadCsvs.Count) Workload files (.csv)" -ForegroundColor Gray
 Write-Host "  - $($testPlanCsvs.Count) Test plan files (.csv)" -ForegroundColor Gray
-Write-Host "  - $($appCsvs.Count) Application inventory files (.csv)" -ForegroundColor Gray
+Write-Host "  - $($appCsvs.Count) Application files (.csv)" -ForegroundColor Gray
+Write-Host "  - $($serversWithData.Count) unique servers identified" -ForegroundColor White
 Write-Host ""
 
-if ($mdFiles.Count -eq 0) {
-    Write-Warning "No discovery outputs found in $InputDirectory"
-    Write-Host "Please run ServerDocumentation-Discovery.ps1 first." -ForegroundColor Yellow
+if ($serversWithData.Count -eq 0) {
+    Write-Warning "No server reports found in $InputDirectory"
+    Write-Host "Expected files like:" -ForegroundColor Yellow
+    Write-Host "  - ServerDocumentation_SERVERNAME_*.md" -ForegroundColor Gray
+    Write-Host "  - Readiness_SERVERNAME_*.md (optional)" -ForegroundColor Gray
+    Write-Host "  - Workloads_SERVERNAME_*.csv (optional)" -ForegroundColor Gray
     exit 1
 }
-
-# Data structures for consolidation
-$allServers = New-Object 'System.Collections.Generic.List[object]'
-$allWorkloads = New-Object 'System.Collections.Generic.List[object]'
-$allApplications = New-Object 'System.Collections.Generic.List[object]'
-$criticalitySummary = @{
-    CRITICAL = 0
-    HIGH = 0
-    MEDIUM = 0
-    LOW = 0
-}
-$workloadTypes = @{}
-$serverRoles = @{}
-
-# Parse each server's documentation
-Write-Progress -Activity "Consolidating Reports" -Status "Parsing server documentation..." -PercentComplete 30
-
-foreach ($mdFile in $mdFiles) {
-    try {
-        $content = Get-Content $mdFile.FullName -Raw
-        $serverName = ($mdFile.BaseName -split '_')[1]
-        
-        # Extract key metrics using regex
-        $criticality = if ($content -match '\*\*Criticality:\*\* (\w+)') { $Matches[1] } else { 'Unknown' }
-        $primaryRole = if ($content -match '\*\*Primary Role:\*\* ([^\r\n]+)') { $Matches[1].Trim() } else { 'Unknown' }
-        $activeWorkloads = if ($content -match '\*\*Active Workloads:\*\* (\d+)') { [int]$Matches[1] } else { 0 }
-        $uniqueUsers = if ($content -match '\*\*Unique Users:\*\* (\d+)') { [int]$Matches[1] } else { 0 }
-        $criticalScore = if ($content -match '\(Score: (\d+)\)') { [int]$Matches[1] } else { 0 }
-        
-        # Extract detected workloads
-        $workloadMatches = [regex]::Matches($content, '- \[ \] \*\*([^:]+):\*\*')
-        $workloadList = $workloadMatches | ForEach-Object { $_.Groups[1].Value }
-        
-        $serverInfo = [PSCustomObject]@{
-            ServerName = $serverName
-            FileName = $mdFile.Name
-            Criticality = $criticality
-            CriticalScore = $criticalScore
-            PrimaryRole = $primaryRole
-            ActiveWorkloads = $activeWorkloads
-            UniqueUsers = $uniqueUsers
-            Workloads = $workloadList
-            FilePath = $mdFile.FullName
-        }
-        
-        $allServers.Add($serverInfo)
         
         # Update criticality counts
         if ($criticalitySummary.ContainsKey($criticality)) {
