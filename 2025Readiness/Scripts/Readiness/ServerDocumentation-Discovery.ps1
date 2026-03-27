@@ -405,7 +405,10 @@ function Invoke-LogonAnalysis {
                     $interactiveLogons++
                 }
 
-                if ($targetUser -and $targetUser -notmatch '\$$' -and $uniqueUsers -notcontains $targetUser) {
+                if ($targetUser -and $targetUser -notmatch '\$$' -and 
+                    $targetUser -notmatch '^(svc|system|administrator|guest|iusr|iwam|network service|local service)' -and 
+                    $targetUser -notmatch 'SVC' -and 
+                    $uniqueUsers -notcontains $targetUser) {
                     $uniqueUsers.Add($targetUser)
                 }
             } catch {
@@ -437,7 +440,7 @@ function Invoke-LogonAnalysis {
 function Invoke-WorkloadDetection {
     Write-Progress-Status "Workloads" "Detecting active workloads..." 60
 
-    # Active Directory
+    # Active Directory - only flag if actually has DS activity
     if ($script:ServerProfile.DetectedRoles -contains 'DomainController') {
         $adEvents = @(Get-SafeEventLog -Filter @{
             LogName = 'Directory Service'
@@ -449,15 +452,21 @@ function Invoke-WorkloadDetection {
             EventActivityLevel = if ($adEvents.Count -gt 100) { 'High' } elseif ($adEvents.Count -gt 10) { 'Moderate' } else { 'Low' }
         }
 
-        $script:ActiveWorkloads.Add([PSCustomObject]@{
-            Type = 'Active Directory Domain Controller'
-            Confidence = 'High'
-            Evidence = "Domain role detected, $($adEvents.Count) DS events in $DaysBack days"
-            Criticality = 'CRITICAL'
-            TestScenario = 'Verify AD replication, LDAP queries, DNS resolution'
-            Details = $adDetails
-        })
-        $script:CriticalityScore += 40
+        # Only consider it an active DC if there are DS events
+        if ($adEvents.Count -gt 0) {
+            $script:ActiveWorkloads.Add([PSCustomObject]@{
+                Type = 'Active Directory Domain Controller'
+                Confidence = 'High'
+                Evidence = "Domain role detected, $($adEvents.Count) DS events in $DaysBack days"
+                Criticality = 'CRITICAL'
+                TestScenario = 'Verify AD replication, LDAP queries, DNS resolution'
+                Details = $adDetails
+            })
+            $script:CriticalityScore += 40
+        } else {
+            # Domain controller services detected but no DS activity - might be a false positive or DC in maintenance mode
+            Write-Verbose "Domain Controller services detected but no DS events found in last $DaysBack days"
+        }
     }
 
     # File Server
@@ -1106,12 +1115,15 @@ function Export-MarkdownReport {
             
             # Add workload-specific details
             if ($workload.Type -eq 'File Server' -and $workload.Details) {
-                $md.Add("  - Shares to test: $(($workload.Details.ActiveShareNames | Select-Object -First 5) -join ', ')")
-                if ($workload.Details.ActiveShares -gt 5) {
-                    $md.Add("  - *... and $($workload.Details.ActiveShares - 5) more*")
+                $md.Add("  - User shares to test: $(($workload.Details.ActiveShareNames | Select-Object -First 5) -join ', ')")
+                if (@($workload.Details.ActiveShareNames).Count -gt 5) {
+                    $md.Add("  - *... and $(@($workload.Details.ActiveShareNames).Count - 5) more*")
                 }
-                if ($workload.Details.ActivityLevel -eq 'No recent access detected') {
-                    $md.Add("  - **Warning:** No share access detected in last $DaysBack days - verify shares are still needed")
+                $md.Add("  - **Open Files:** $($workload.Details.OpenFiles)")
+                $md.Add("  - **Active Sessions:** $($workload.Details.ActiveSessions)")
+                $md.Add("  - **Activity Level:** $($workload.Details.ActivityLevel)")
+                if ($workload.Details.ActivityLevel -eq 'No user share activity detected') {
+                    $md.Add("  - **Warning:** No user share access detected in last $DaysBack days - verify shares are still needed")
                 }
             }
             if ($workload.Type -eq 'SQL Server Database Engine' -and $workload.Details) {
@@ -1237,18 +1249,29 @@ function Export-MarkdownReport {
 
     # File Server Share Details (if applicable)
     $fileServerWorkload = $script:ActiveWorkloads | Where-Object { $_.Type -eq 'File Server' }
-    if ($fileServerWorkload -and $fileServerWorkload.Details -and $fileServerWorkload.Details.ActiveShareNames.Count -gt 0) {
+    if ($fileServerWorkload -and $fileServerWorkload.Details -and $fileServerWorkload.Details.IsActiveFileServer) {
         $md.Add("## Active File Shares")
         $md.Add("")
-        $md.Add("Shares with recent access activity:")
+        $md.Add("User shares with recent activity:")
+        $md.Add("")
+        $md.Add("**Total User Shares:** $($fileServerWorkload.Details.UserShares)")
+        $md.Add("**Active Shares:** $($fileServerWorkload.Details.ActiveShares)")
+        $md.Add("**Open Files:** $($fileServerWorkload.Details.OpenFiles)")
+        $md.Add("**Active Sessions:** $($fileServerWorkload.Details.ActiveSessions)")
+        $md.Add("**Activity Level:** $($fileServerWorkload.Details.ActivityLevel)")
         $md.Add("")
         foreach ($share in $fileServerWorkload.Details.ActiveShareNames | Select-Object -First 20) {
             $md.Add("- $share")
         }
-        if ($fileServerWorkload.Details.ActiveShares -lt $fileServerWorkload.Details.TotalShares) {
-            $unusedShares = $fileServerWorkload.Details.TotalShares - $fileServerWorkload.Details.ActiveShares
+        if (@($fileServerWorkload.Details.ActiveShareNames).Count -gt 20) {
+            $remaining = @($fileServerWorkload.Details.ActiveShareNames).Count - 20
             $md.Add("")
-            $md.Add("**Warning:** $unusedShares share(s) exist but show no access in the last $DaysBack days. Review for cleanup.")
+            $md.Add("*... and $remaining more active shares*")
+        }
+        if ($fileServerWorkload.Details.ActiveShares -lt $fileServerWorkload.Details.UserShares) {
+            $unusedShares = $fileServerWorkload.Details.UserShares - $fileServerWorkload.Details.ActiveShares
+            $md.Add("")
+            $md.Add("**Note:** $unusedShares user share(s) exist but show no access in the last $DaysBack days.")
         }
         $md.Add("")
     }
@@ -1458,7 +1481,7 @@ function Export-CsvReports {
                     $detailSummary = "$($workload.Details.ActiveDatabases)/$($workload.Details.Databases.Count) active DBs, $($workload.Details.TotalConnections) connections"
                 }
                 'File Server' {
-                    $detailSummary = "$($workload.Details.ActiveShares)/$($workload.Details.TotalShares) active shares, $($workload.Details.UniqueShareUsers) users"
+                    $detailSummary = "$($workload.Details.UserShares) user shares, $($workload.Details.ActiveShares) active, $($workload.Details.OpenFiles) open files, $($workload.Details.ActiveSessions) sessions"
                 }
                 'DHCP Server' {
                     $detailSummary = "$($workload.Details.ActiveLeases) leases, $($workload.Details.LeasePercentage)% utilized"
@@ -1553,9 +1576,9 @@ try {
     $fileServerWorkload = $script:ActiveWorkloads | Where-Object { $_.Type -eq 'File Server' }
     if ($fileServerWorkload -and $fileServerWorkload.Details) {
         $details = $fileServerWorkload.Details
-        Write-Host "File Server: $($details.TotalShares) shares, $($details.ActiveShares) active, $($details.UniqueShareUsers) users" -ForegroundColor White
-        if ($details.ActivityLevel -eq 'No recent access detected') {
-            Write-Host "  WARNING: No share access detected in last $DaysBack days" -ForegroundColor Yellow
+        Write-Host "File Server: $($details.UserShares) user shares, $($details.ActiveShares) active, $($details.OpenFiles) open files, $($details.ActiveSessions) sessions" -ForegroundColor White
+        if ($details.ActivityLevel -eq 'No user share activity detected') {
+            Write-Host "  WARNING: No user share activity detected in last $DaysBack days" -ForegroundColor Yellow
         }
     }
     
