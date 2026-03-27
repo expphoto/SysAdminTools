@@ -1,123 +1,229 @@
-#!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Creates per-server consolidated reports combining Discovery + Readiness data.
+    Creates change-ready consolidated reports from discovery and readiness outputs.
 
 .DESCRIPTION
-    For each server, combines:
-    - ServerDocumentation-Discovery.ps1 output (technical analysis)
-    - Readiness-Assessment.ps1 output (upgrade readiness, if exists)
-    - Workloads CSV (detailed workload info)
-    - Test Plan CSV (testing scenarios)
-    - Applications CSV (installed apps)
+    Produces a per-server markdown report intended to support change requests,
+    due diligence, upgrade planning, and CAB review. The report pulls forward:
+    - Current state and workloads
+    - Upgrade decision and blockers
+    - Evidence-backed findings
+    - Pre-change and post-change validation steps
+    - Rollback and execution notes
 
-    Creates TWO outputs:
-    1. Per-server consolidated report (one per server)
-    2. Master summary report (across all servers)
-
-.PARAMETER InputDirectory
-    Folder containing server reports. If not provided, will prompt for selection.
-
-.PARAMETER OutputDirectory
-    Where to save consolidated reports (default: ConsolidatedReports subfolder)
-
-.EXAMPLE
-    .\Consolidated-UpgradeReport.ps1
-    Prompts for folder, then processes all servers
-
-.EXAMPLE
-    .\Consolidated-UpgradeReport.ps1 -InputDirectory "C:\ServerReports\2025Readiness"
+    Also creates a master summary across all discovered servers.
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [string]$InputDirectory,
-    
-    [Parameter(Mandatory=$false)]
+
+    [Parameter(Mandatory = $false)]
     [string]$OutputDirectory,
-    
+
     [int]$DaysBack = 14
 )
 
-# Set default output directory
-if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $OutputDirectory = Join-Path $PSScriptRoot "ConsolidatedReports"
+function Get-MatchValue {
+    param(
+        [string]$Text,
+        [string]$Pattern,
+        [int]$Group = 1
+    )
+
+    $match = [regex]::Match($Text, $Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($match.Success) {
+        return $match.Groups[$Group].Value.Trim()
+    }
+
+    return $null
 }
 
-# Interactive folder selection
-if ([string]::IsNullOrWhiteSpace($InputDirectory)) {
-    Write-Host "`n📁 Server Reports Consolidation" -ForegroundColor Cyan
-    Write-Host "`nSelect the folder containing server discovery reports.`n" -ForegroundColor Gray
-    
-    # Try Windows Forms first
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-        $dialog.Description = "Select folder with ServerDocumentation_*.md files"
-        $dialog.RootFolder = [System.Environment+SpecialFolder]::MyComputer
-        
-        # Default to script parent folder
-        $parentPath = Split-Path $PSScriptRoot -Parent
-        if (Test-Path $parentPath) {
-            $dialog.SelectedPath = $parentPath
+function Get-SectionContent {
+    param(
+        [string]$Text,
+        [string]$Heading
+    )
+
+    $pattern = '(?ms)^##\s+' + [regex]::Escape($Heading) + '\s*\r?\n(.*?)(?=^##\s+|\Z)'
+    $match = [regex]::Match($Text, $pattern)
+    if ($match.Success) {
+        return $match.Groups[1].Value.Trim()
+    }
+
+    return $null
+}
+
+function Get-BulletLines {
+    param(
+        [string]$SectionText
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SectionText)) {
+        return @()
+    }
+
+    return @(
+        ($SectionText -split "`r?`n") |
+        Where-Object { $_ -match '^\s*-\s+' } |
+        ForEach-Object { $_.Trim() }
+    )
+}
+
+function Get-FirstTable {
+    param(
+        [string]$SectionText,
+        [int]$MaxLines = 12
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SectionText)) {
+        return @()
+    }
+
+    $lines = $SectionText -split "`r?`n"
+    $table = New-Object 'System.Collections.Generic.List[string]'
+    $inTable = $false
+
+    foreach ($line in $lines) {
+        if ($line.Trim().StartsWith('|')) {
+            $inTable = $true
+            if ($table.Count -lt $MaxLines) {
+                $table.Add($line)
+            }
+            continue
         }
-        
-        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            $InputDirectory = $dialog.SelectedPath
-        } else {
-            Write-Error "No folder selected. Exiting."
-            exit 1
+
+        if ($inTable) {
+            break
         }
-    } catch {
-        # Text fallback
-        Write-Host "Enter folder path: " -NoNewline -ForegroundColor Yellow
-        $InputDirectory = Read-Host
-        if (-not (Test-Path $InputDirectory)) {
-            Write-Error "Invalid path. Exiting."
-            exit 1
-        }
+    }
+
+    return $table.ToArray()
+}
+
+function Get-KeyValueBullets {
+    param(
+        [string]$SectionText,
+        [int]$MaxLines = 8
+    )
+
+    return @(Get-BulletLines -SectionText $SectionText | Select-Object -First $MaxLines)
+}
+
+function Add-Lines {
+    param(
+        [System.Collections.Generic.List[string]]$Report,
+        [string[]]$Lines
+    )
+
+    foreach ($line in $Lines) {
+        $Report.Add($line)
     }
 }
 
-# Validate input
+function Get-ReadinessFindings {
+    param(
+        [string]$Content,
+        [string]$Heading
+    )
+
+    $section = Get-SectionContent -Text $Content -Heading $Heading
+    if ([string]::IsNullOrWhiteSpace($section)) {
+        return @()
+    }
+
+    $findings = New-Object 'System.Collections.Generic.List[object]'
+    $pattern = '(?ms)^-\s+(.*?)\s*\|\s*Confidence:\s*\*\*(.*?)\*\*\s*\r?\n\s*Evidence:\s*(.*?)\s*\r?\n\s*Why 2025:\s*(.*?)\s*\r?\n\s*Action:\s*(.*?)(?=^\s*-\s+.*?\|\s*Confidence:|\Z)'
+    $matches = [regex]::Matches($section, $pattern)
+
+    foreach ($match in $matches) {
+        $findings.Add([PSCustomObject]@{
+            Name = $match.Groups[1].Value.Trim()
+            Confidence = $match.Groups[2].Value.Trim()
+            Evidence = $match.Groups[3].Value.Trim()
+            Why = $match.Groups[4].Value.Trim()
+            Action = $match.Groups[5].Value.Trim()
+        })
+    }
+
+    return $findings.ToArray()
+}
+
+function Get-ReadinessGapLines {
+    param(
+        [string]$Content
+    )
+
+    $section = Get-SectionContent -Text $Content -Heading '2025 Telemetry Gaps'
+    return @(Get-BulletLines -SectionText $section)
+}
+
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $OutputDirectory = Join-Path $PSScriptRoot 'ConsolidatedReports'
+}
+
+if ([string]::IsNullOrWhiteSpace($InputDirectory)) {
+    Write-Host "`n== Server Reports Consolidation ==" -ForegroundColor Cyan
+    Write-Host "`nSelect the folder containing the generated markdown reports.`n" -ForegroundColor Gray
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dialog.Description = 'Select folder with readiness/discovery markdown reports'
+        $dialog.RootFolder = [System.Environment+SpecialFolder]::MyComputer
+        if (Test-Path $PSScriptRoot) {
+            $dialog.SelectedPath = $PSScriptRoot
+        }
+
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $InputDirectory = $dialog.SelectedPath
+        } else {
+            Write-Error 'No folder selected. Exiting.'
+            exit 1
+        }
+    } catch {
+        Write-Host 'Enter folder path: ' -NoNewline -ForegroundColor Yellow
+        $InputDirectory = Read-Host
+    }
+}
+
 if (-not (Test-Path $InputDirectory)) {
     Write-Error "Input directory not found: $InputDirectory"
     exit 1
 }
 
-# Create output folder
 if (-not (Test-Path $OutputDirectory)) {
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 }
 
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$reportDate = Get-Date -Format "yyyy-MM-dd HH:mm"
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$reportDate = Get-Date -Format 'yyyy-MM-dd HH:mm'
 
-Write-Host "`n╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║     SERVER UPGRADE READINESS - CONSOLIDATED REPORTS           ║" -ForegroundColor Cyan
-Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host "`n==============================================================" -ForegroundColor Cyan
+Write-Host 'SERVER UPGRADE READINESS - CHANGE-READY REPORTS' -ForegroundColor Cyan
+Write-Host '==============================================================' -ForegroundColor Cyan
 Write-Host "Input:  $InputDirectory" -ForegroundColor Gray
 Write-Host "Output: $OutputDirectory`n" -ForegroundColor Gray
 
-# Scan for files
-Write-Host "Scanning for server reports..." -ForegroundColor White
+Write-Host 'Scanning for server reports...' -ForegroundColor White
 
-$discoveryFiles = Get-ChildItem -Path $InputDirectory -Filter "ServerDocumentation_*.md" -Recurse -ErrorAction SilentlyContinue
-$readinessFiles = Get-ChildItem -Path $InputDirectory -Filter "Readiness_*.md" -Recurse -ErrorAction SilentlyContinue
-$workloadFiles = Get-ChildItem -Path $InputDirectory -Filter "Workloads_*.csv" -Recurse -ErrorAction SilentlyContinue
-$testPlanFiles = Get-ChildItem -Path $InputDirectory -Filter "TestPlan_*.csv" -Recurse -ErrorAction SilentlyContinue
-$appFiles = Get-ChildItem -Path $InputDirectory -Filter "Applications_*.csv" -Recurse -ErrorAction SilentlyContinue
+$discoveryFiles = Get-ChildItem -Path $InputDirectory -Recurse -ErrorAction SilentlyContinue -File |
+    Where-Object { $_.Name -like 'ServerDocumentation_*.md' -or $_.Name -like 'ServerDoc_*.md' }
+$readinessFiles = Get-ChildItem -Path $InputDirectory -Recurse -ErrorAction SilentlyContinue -File |
+    Where-Object { $_.Name -like 'Readiness_*.md' -or $_.Name -like 'WS2025_ProductionReadiness_*.md' }
+$workloadFiles = Get-ChildItem -Path $InputDirectory -Filter 'Workloads_*.csv' -Recurse -ErrorAction SilentlyContinue
+$testPlanFiles = Get-ChildItem -Path $InputDirectory -Filter 'TestPlan_*.csv' -Recurse -ErrorAction SilentlyContinue
+$appFiles = Get-ChildItem -Path $InputDirectory -Filter 'Applications_*.csv' -Recurse -ErrorAction SilentlyContinue
 
 Write-Host "  Found: $($discoveryFiles.Count) Discovery, $($readinessFiles.Count) Readiness, $($workloadFiles.Count) Workloads, $($testPlanFiles.Count) Test Plans, $($appFiles.Count) Apps" -ForegroundColor Gray
 
-# Group by server name
 $serverData = @{}
 
 function Add-FileToServer($file, $type) {
     if ($file.BaseName -match '_([A-Z0-9-]+)_[0-9]{8}_') {
         $serverName = $Matches[1]
-        
+
         if (-not $serverData.ContainsKey($serverName)) {
             $serverData[$serverName] = @{
                 Discovery = $null
@@ -127,7 +233,7 @@ function Add-FileToServer($file, $type) {
                 Applications = $null
             }
         }
-        
+
         $serverData[$serverName][$type] = $file
     }
 }
@@ -141,311 +247,379 @@ $appFiles | ForEach-Object { Add-FileToServer $_ 'Applications' }
 Write-Host "  Identified: $($serverData.Count) unique servers`n" -ForegroundColor White
 
 if ($serverData.Count -eq 0) {
-    Write-Error "No server reports found. Expected files like ServerDocumentation_SERVERNAME_*.md"
+    Write-Error 'No server reports found.'
     exit 1
 }
 
-# Arrays for master summary
 $allServerSummaries = New-Object 'System.Collections.Generic.List[object]'
 
-# Process each server
 $serverIndex = 0
 foreach ($serverEntry in $serverData.GetEnumerator() | Sort-Object Key) {
     $serverName = $serverEntry.Key
     $files = $serverEntry.Value
     $serverIndex++
-    
-    Write-Progress -Activity "Processing Servers" -Status $serverName -PercentComplete (($serverIndex / $serverData.Count) * 100)
+
+    Write-Progress -Activity 'Processing Servers' -Status $serverName -PercentComplete (($serverIndex / $serverData.Count) * 100)
     Write-Host "Processing: $serverName" -ForegroundColor White
-    
-    # Build consolidated report for this server
+
     $report = New-Object 'System.Collections.Generic.List[string]'
-    
-    # Header
-    $report.Add("# Consolidated Report: $serverName")
-    $report.Add("")
-    $report.Add("**Generated:** $reportDate  ")
-    $report.Add("**Analysis Period:** Last $DaysBack days  ")
-    $report.Add("")
-    
-    # Data Sources section
-    $report.Add("## Data Sources")
-    $report.Add("")
-    $report.Add("| Type | File | Status |")
-    $report.Add("|------|------|--------|")
-    $report.Add("| Discovery | $(if($files.Discovery){$files.Discovery.Name}else{'Not found'}) | $(if($files.Discovery){'Present'}else{'Missing'}) |")
-    $report.Add("| Readiness | $(if($files.Readiness){$files.Readiness.Name}else{'Not found'}) | $(if($files.Readiness){'Present'}else{'Optional'}) |")
-    $report.Add("| Workloads | $(if($files.Workloads){$files.Workloads.Name}else{'Not found'}) | $(if($files.Workloads){'Present'}else{'Optional'}) |")
-    $report.Add("| Test Plan | $(if($files.TestPlan){$files.TestPlan.Name}else{'Not found'}) | $(if($files.TestPlan){'Present'}else{'Optional'}) |")
-    $report.Add("| Applications | $(if($files.Applications){$files.Applications.Name}else{'Not found'}) | $(if($files.Applications){'Present'}else{'Optional'}) |")
-    $report.Add("")
-    
-    $criticality = "Unknown"
+    $criticality = 'Unknown'
     $criticalScore = 0
-    $role = "Unknown"
-    $workloads = @()
+    $role = 'Unknown'
+    $osName = 'Unknown'
+    $build = 'Unknown'
+    $domainRole = 'Unknown'
+    $ipAddresses = 'Unknown'
+    $impactIfDown = 'Unknown'
+    $workloadCount = 0
     $userCount = 0
-    $workloadDetails = @()
-    $appDetails = @()
-    
-    # Parse Discovery data
+    $decision = 'Decision not available'
+    $evidenceWindow = "$DaysBack day(s)"
+    $goStatus = 'UNKNOWN'
+
+    $confirmedUseFindings = @()
+    $configuredFindings = @()
+    $telemetryGaps = @()
+    $priorityTests = @()
+    $generalTests = @()
+    $postMaintenanceTests = @()
+    $workloadTable = @()
+    $systemInfoTable = @()
+    $networkActivityLines = @()
+    $recommendationLines = @()
+    $applicationRows = @()
+
+    $discoveryContent = $null
     if ($files.Discovery) {
         try {
-            $content = Get-Content $files.Discovery.FullName -Raw
-            
-            # Extract metrics
-            if ($content -match '\*\*Criticality:\*\*\s*(\w+)') { $criticality = $Matches[1] }
-            if ($content -match 'Score:\s*(\d+)') { $criticalScore = [int]$Matches[1] }
-            if ($content -match '\*\*Primary Role:\*\*\s*([^\r\n]+)') { $role = $Matches[1].Trim() }
-            if ($content -match '\*\*Unique Users:\*\*\s*(\d+)') { $userCount = [int]$Matches[1] }
-            
-            # Extract workload list
-            $workloadMatches = [regex]::Matches($content, '- \[ \] \*\*([^\*]+):\*\*')
-            $workloads = $workloadMatches | ForEach-Object { $_.Groups[1].Value.Trim() }
-            
-            $report.Add("---")
-            $report.Add("")
-            $report.Add("## Executive Summary")
-            $report.Add("")
-            $report.Add("- **Criticality:** $criticality (Score: $criticalScore)")
-            $report.Add("- **Primary Role:** $role")
-            $report.Add("- **Active Workloads:** $($workloads.Count)")
-            $report.Add("- **Unique Users:** $userCount")
-            $report.Add("")
-            
-            # Add summary sections from discovery
-            if ($content -match '## Workload Analysis(?s)(.*?)## ') {
-                $report.Add("### Workload Analysis")
-                $report.Add("")
-                $report.Add($Matches[1].Trim())
-                $report.Add("")
+            $discoveryContent = Get-Content -Path $files.Discovery.FullName -Raw
+            $roleValue = Get-MatchValue -Text $discoveryContent -Pattern '\*\*Primary Role:\*\*\s*([^\r\n]+)'
+            if ($roleValue) { $role = $roleValue }
+
+            $criticalityValue = Get-MatchValue -Text $discoveryContent -Pattern '\*\*Criticality:\*\*\s*\*\*(\w+)\*\*'
+            if (-not $criticalityValue) {
+                $criticalityValue = Get-MatchValue -Text $discoveryContent -Pattern '\*\*Criticality:\*\*\s*(\w+)'
             }
-            
+            if ($criticalityValue) { $criticality = $criticalityValue.ToUpperInvariant() }
+
+            $scoreValue = Get-MatchValue -Text $discoveryContent -Pattern 'Score:\s*(\d+)'
+            if ($scoreValue) { $criticalScore = [int]$scoreValue }
+
+            $impactValue = Get-MatchValue -Text $discoveryContent -Pattern '\*\*Impact if Down:\*\*\s*([^\r\n]+)'
+            if ($impactValue) { $impactIfDown = $impactValue }
+
+            $workloadValue = Get-MatchValue -Text $discoveryContent -Pattern '\*\*Active Workloads:\*\*\s*(\d+)'
+            if ($workloadValue) { $workloadCount = [int]$workloadValue }
+
+            $userCountValue = Get-MatchValue -Text $discoveryContent -Pattern '\*\*Unique Users(?: \(last \d+ days\))?:\*\*\s*(\d+)'
+            if ($userCountValue) { $userCount = [int]$userCountValue }
+
+            $systemInformation = Get-SectionContent -Text $discoveryContent -Heading 'System Information'
+            $systemInfoTable = @(Get-FirstTable -SectionText $systemInformation)
+            $osValue = Get-MatchValue -Text $systemInformation -Pattern '\|\s*Operating System\s*\|\s*([^|\r\n]+)\|'
+            if ($osValue) { $osName = $osValue }
+            $buildValue = Get-MatchValue -Text $systemInformation -Pattern '\|\s*Build\s*\|\s*([^|\r\n]+)\|'
+            if ($buildValue) { $build = $buildValue }
+            $domainRoleValue = Get-MatchValue -Text $systemInformation -Pattern '\|\s*Domain Role\s*\|\s*([^|\r\n]+)\|'
+            if ($domainRoleValue) { $domainRole = $domainRoleValue }
+            $ipValue = Get-MatchValue -Text $systemInformation -Pattern '\|\s*IP Address\(es\)\s*\|\s*([^|\r\n]+)\|'
+            if ($ipValue) { $ipAddresses = $ipValue }
+
+            $activeWorkloadsSection = Get-SectionContent -Text $discoveryContent -Heading 'Active Workloads'
+            $workloadTable = @(Get-FirstTable -SectionText $activeWorkloadsSection -MaxLines 10)
+
+            $testingChecklist = Get-SectionContent -Text $discoveryContent -Heading 'Testing Checklist'
+            $priorityBlock = Get-MatchValue -Text $testingChecklist -Pattern '(?ms)^###\s+Priority Test Scenarios\s*\r?\n(.*?)(?=^###\s+|\Z)'
+            $generalBlock = Get-MatchValue -Text $testingChecklist -Pattern '(?ms)^###\s+General Tests\s*\r?\n(.*?)(?=^###\s+|\Z)'
+            $postBlock = Get-MatchValue -Text $testingChecklist -Pattern '(?ms)^###\s+Post-Maintenance Validation\s*\r?\n(.*?)(?=^###\s+|\Z)'
+
+            $priorityTests = @(Get-BulletLines -SectionText $priorityBlock)
+            $generalTests = @(Get-BulletLines -SectionText $generalBlock)
+            $postMaintenanceTests = @(Get-BulletLines -SectionText $postBlock)
+
+            $networkActivity = Get-SectionContent -Text $discoveryContent -Heading 'Network Activity'
+            $networkActivityLines = @(Get-KeyValueBullets -SectionText $networkActivity -MaxLines 4)
+
+            $recommendationsSection = Get-SectionContent -Text $discoveryContent -Heading 'Recommendations'
+            if ($recommendationsSection) {
+                $recommendationLines = @(
+                    ($recommendationsSection -split "`r?`n") |
+                    Where-Object { $_ -match '^\s*\d+\.\s+' } |
+                    ForEach-Object { $_.Trim() }
+                )
+            }
         } catch {
-            Write-Warning "Could not parse discovery for $serverName"
+            Write-Warning "Could not parse discovery for ${serverName}: $($_.Exception.Message)"
         }
     }
-    
-    # Parse Workload CSV
-    if ($files.Workloads) {
+
+    $readinessContent = $null
+    if ($files.Readiness) {
         try {
-            $workloadDetails = Import-Csv $files.Workloads.FullName
-            
-            if ($workloadDetails.Count -gt 0) {
-                $report.Add("## Detected Workloads")
-                $report.Add("")
-                $report.Add("| Workload | Criticality | Confidence |")
-                $report.Add("|----------|-------------|------------|")
-                
-                foreach ($wl in $workloadDetails | Sort-Object Criticality -Descending | Select-Object -First 10) {
-                    $evidence = if ($wl.Evidence.Length -gt 50) { $wl.Evidence.Substring(0,50) + "..." } else { $wl.Evidence }
-                    $report.Add("| $($wl.Type) | $($wl.Criticality) | $($wl.Confidence) |")
-                }
-                $report.Add("")
+            $readinessContent = Get-Content -Path $files.Readiness.FullName -Raw
+            $decisionValue = Get-MatchValue -Text $readinessContent -Pattern '-\s+Decision:\s*\*\*(.*?)\*\*'
+            if ($decisionValue) { $decision = $decisionValue }
+
+            $evidenceWindowValue = Get-MatchValue -Text $readinessContent -Pattern '-\s+Evidence Window:\s*([^\r\n]+)'
+            if ($evidenceWindowValue) { $evidenceWindow = $evidenceWindowValue }
+
+            if ($decision -match '^NO-GO') {
+                $goStatus = 'NO-GO'
+            } elseif ($decision -match '^GO') {
+                $goStatus = 'GO'
+            } elseif ($decision -match '^CONDITIONAL') {
+                $goStatus = 'CONDITIONAL'
             }
+
+            $confirmedUseFindings = @(Get-ReadinessFindings -Content $readinessContent -Heading '2025 Changes With Confirmed Use')
+            $configuredFindings = @(Get-ReadinessFindings -Content $readinessContent -Heading '2025 Changes Configured But Usage Not Proven')
+            $telemetryGaps = @(Get-ReadinessGapLines -Content $readinessContent)
         } catch {
-            Write-Warning "Could not parse workloads for $serverName"
+            Write-Warning "Could not parse readiness for ${serverName}: $($_.Exception.Message)"
         }
     }
-    
-    # Parse Applications
+
     if ($files.Applications) {
         try {
-            $appDetails = Import-Csv $files.Applications.FullName
-            $activeApps = $appDetails | Where-Object { $_.Status -eq 'Active' }
-            
-            if ($activeApps.Count -gt 0) {
-                $report.Add("## Active Applications")
-                $report.Add("")
-                $report.Add("| Application | Version | Publisher | Priority |")
-                $report.Add("|-------------|---------|-----------|----------|")
-                
-                foreach ($app in $activeApps | Select-Object -First 10) {
-                    $report.Add("| $($app.Name) | $($app.Version) | $($app.Publisher) | $($app.TestPriority) |")
-                }
-                $report.Add("")
-            }
+            $applicationRows = @(Import-Csv -Path $files.Applications.FullName | Where-Object { $_.Status -eq 'Active' } | Select-Object -First 10)
         } catch {
-            Write-Warning "Could not parse applications for $serverName"
+            Write-Warning "Could not parse applications for ${serverName}: $($_.Exception.Message)"
         }
     }
-    
-    # Parse Test Plan
-    if ($files.TestPlan) {
-        try {
-            $testData = Import-Csv $files.TestPlan.FullName
-            
-            if ($testData.Count -gt 0) {
-                $report.Add("## Testing Checklist")
-                $report.Add("")
-                
-                $priorityTests = $testData | Where-Object { $_.Criticality -in @('CRITICAL','HIGH') }
-                foreach ($test in $priorityTests) {
-                    $report.Add("- [ ] **$($test.Component):** $($test.TestScenario)")
-                }
-                $report.Add("")
-            }
-        } catch {
-            Write-Warning "Could not parse test plan for $serverName"
+
+    $blockerCount = $confirmedUseFindings.Count
+    $riskCount = $configuredFindings.Count + $telemetryGaps.Count
+
+    $report.Add("# Change Support Report: $serverName")
+    $report.Add('')
+    $report.Add("**Generated:** $reportDate  ")
+    $report.Add("**Analysis Period:** Last $DaysBack days  ")
+    $report.Add("**Evidence Window:** $evidenceWindow  ")
+    $report.Add('')
+
+    $report.Add('## Change Summary')
+    $report.Add('')
+    $report.Add('| Field | Value |')
+    $report.Add('|-------|-------|')
+    $report.Add("| Server | $serverName |")
+    $report.Add("| Proposed Activity | OS upgrade / change requiring readiness validation |")
+    $report.Add("| Current Operating System | $osName |")
+    $report.Add("| Current Build | $build |")
+    $report.Add("| Primary Role | $role |")
+    $report.Add("| Criticality | $criticality |")
+    $report.Add("| Criticality Score | $criticalScore |")
+    $report.Add("| Business Impact if Down | $impactIfDown |")
+    $report.Add("| Decision | $decision |")
+    $report.Add("| Confirmed Blockers | $blockerCount |")
+    $report.Add("| Additional Risks / Gaps | $riskCount |")
+    $report.Add('')
+
+    $report.Add('## Recommended Change Position')
+    $report.Add('')
+    switch ($goStatus) {
+        'NO-GO' {
+            $report.Add("This server is currently **not ready** for the proposed change. Evidence shows at least one confirmed compatibility or dependency risk that should be remediated before approval.")
+        }
+        'GO' {
+            $report.Add("This server appears **ready** for the proposed change based on the available evidence, provided the validation and rollback controls below are followed.")
+        }
+        'CONDITIONAL' {
+            $report.Add("This server may proceed only as a **conditional go**. Approval should depend on completion of the remediation and validation items listed below.")
+        }
+        default {
+            $report.Add('A definitive go/no-go statement was not found. Review the source readiness report and validation sections below before submitting a change request.')
         }
     }
-    
-    # Add full discovery content at the end
-    if ($files.Discovery) {
-        $report.Add("---")
-        $report.Add("")
-        $report.Add("## Full Discovery Report")
-        $report.Add("")
-        $report.Add("See: $($files.Discovery.FullName)")
-        $report.Add("")
+    $report.Add('')
+
+    $report.Add('## Due Diligence Evidence')
+    $report.Add('')
+    $report.Add('- Current state was assessed from discovery and readiness outputs generated for this server.')
+    $report.Add("- Host role: **$role**")
+    $report.Add("- Workloads identified: **$workloadCount**")
+    $report.Add("- Unique users observed: **$userCount**")
+    $report.Add("- Domain role: **$domainRole**")
+    $report.Add("- IP address(es): **$ipAddresses**")
+    if ($networkActivityLines.Count -gt 0) {
+        Add-Lines -Report $report -Lines $networkActivityLines
     }
-    
-    # Save per-server report
-    $serverReportPath = Join-Path $OutputDirectory "Consolidated_${serverName}_${timestamp}.md"
+    $report.Add('')
+
+    if ($systemInfoTable.Count -gt 0) {
+        $report.Add('### System Baseline')
+        $report.Add('')
+        Add-Lines -Report $report -Lines $systemInfoTable
+        $report.Add('')
+    }
+
+    if ($workloadTable.Count -gt 0) {
+        $report.Add('### Active Workloads in Scope')
+        $report.Add('')
+        Add-Lines -Report $report -Lines $workloadTable
+        $report.Add('')
+    }
+
+    $report.Add('## Findings That Affect Change Approval')
+    $report.Add('')
+    if ($confirmedUseFindings.Count -eq 0 -and $configuredFindings.Count -eq 0 -and $telemetryGaps.Count -eq 0) {
+        $report.Add('No readiness findings were parsed from the source report. Manual review is recommended before approval.')
+        $report.Add('')
+    } else {
+        if ($confirmedUseFindings.Count -gt 0) {
+            $report.Add('### Confirmed Blockers')
+            $report.Add('')
+            foreach ($finding in $confirmedUseFindings) {
+                $report.Add("- **$($finding.Name)** | Confidence: **$($finding.Confidence)**")
+                $report.Add("  Evidence: $($finding.Evidence)")
+                $report.Add("  Upgrade relevance: $($finding.Why)")
+                $report.Add("  Required action: $($finding.Action)")
+            }
+            $report.Add('')
+        }
+
+        if ($configuredFindings.Count -gt 0) {
+            $report.Add('### Risks Requiring Validation')
+            $report.Add('')
+            foreach ($finding in $configuredFindings) {
+                $report.Add("- **$($finding.Name)** | Confidence: **$($finding.Confidence)**")
+                $report.Add("  Evidence: $($finding.Evidence)")
+                $report.Add("  Upgrade relevance: $($finding.Why)")
+                $report.Add("  Validation action: $($finding.Action)")
+            }
+            $report.Add('')
+        }
+
+        if ($telemetryGaps.Count -gt 0) {
+            $report.Add('### Telemetry Gaps / Assumptions')
+            $report.Add('')
+            foreach ($gap in $telemetryGaps) {
+                $report.Add($gap)
+            }
+            $report.Add('')
+        }
+    }
+
+    $report.Add('## Change Request Narrative')
+    $report.Add('')
+    $report.Add('Use the following summary in a change request description:')
+    $report.Add('')
+    $report.Add('> Due diligence was completed against the current server state, observed workloads, upgrade-readiness findings, and validation requirements. The server hosts identified production functions and was assessed using evidence collected from the recent analysis window. The change should only proceed in line with the decision recorded above and after completing all required validation and remediation actions.')
+    $report.Add('')
+
+    $report.Add('## Pre-Change Checklist')
+    $report.Add('')
+    $report.Add('- [ ] Confirm latest backup/snapshot and rollback path are available and tested.')
+    $report.Add('- [ ] Confirm maintenance window, outage expectation, and stakeholder approval.')
+    $report.Add('- [ ] Confirm application owners for all listed workloads are aware and available if needed.')
+    $report.Add('- [ ] Review confirmed blockers and validation risks in this report.')
+    if ($priorityTests.Count -gt 0) {
+        foreach ($test in $priorityTests) {
+            $report.Add($test)
+        }
+    }
+    if ($generalTests.Count -gt 0) {
+        foreach ($test in $generalTests) {
+            $report.Add($test)
+        }
+    }
+    $report.Add('')
+
+    $report.Add('## Post-Change Validation')
+    $report.Add('')
+    if ($postMaintenanceTests.Count -gt 0) {
+        foreach ($test in $postMaintenanceTests) {
+            $report.Add($test)
+        }
+    } else {
+        $report.Add('- [ ] Verify services, ports, authentication, monitoring, and workload-specific tests all pass.')
+        $report.Add('- [ ] Review System/Application/Security events for new errors after the change.')
+        $report.Add('- [ ] Confirm end-user or app-owner validation for all in-scope workloads.')
+    }
+    $report.Add('')
+
+    $report.Add('## Rollback Considerations')
+    $report.Add('')
+    $report.Add('- If critical workload validation fails, initiate rollback using the approved backup/snapshot procedure.')
+    $report.Add('- Preserve event logs, screenshots, installer output, and validation results for the change record.')
+    $report.Add('- Reconfirm service health, application pools, file access, and remote management after rollback.')
+    $report.Add('')
+
+    if ($applicationRows.Count -gt 0) {
+        $report.Add('## Active Applications Snapshot')
+        $report.Add('')
+        $report.Add('| Application | Version | Publisher | Priority |')
+        $report.Add('|-------------|---------|-----------|----------|')
+        foreach ($app in $applicationRows) {
+            $report.Add("| $($app.Name) | $($app.Version) | $($app.Publisher) | $($app.TestPriority) |")
+        }
+        $report.Add('')
+    }
+
+    if ($recommendationLines.Count -gt 0) {
+        $report.Add('## Supporting Recommendations')
+        $report.Add('')
+        foreach ($line in $recommendationLines) {
+            $report.Add("- $($line -replace '^\s*\d+\.\s*', '')")
+        }
+        $report.Add('')
+    }
+
+    $report.Add('## Source Evidence')
+    $report.Add('')
+    $report.Add('| Source | File |')
+    $report.Add('|--------|------|')
+    $report.Add("| Discovery | $($files.Discovery.Name) |")
+    $report.Add("| Readiness | $(if ($files.Readiness) { $files.Readiness.Name } else { 'Not found' }) |")
+    $report.Add("| Workloads CSV | $(if ($files.Workloads) { $files.Workloads.Name } else { 'Not found' }) |")
+    $report.Add("| Test Plan CSV | $(if ($files.TestPlan) { $files.TestPlan.Name } else { 'Not found' }) |")
+    $report.Add("| Applications CSV | $(if ($files.Applications) { $files.Applications.Name } else { 'Not found' }) |")
+    $report.Add('')
+
+    $serverReportPath = Join-Path $OutputDirectory "ChangeSupport_${serverName}_${timestamp}.md"
     $report | Out-File -FilePath $serverReportPath -Encoding UTF8
-    Write-Host "  ✓ Saved: $([System.IO.Path]::GetFileName($serverReportPath))" -ForegroundColor Green
-    
-    # Add to summary for master report
+    Write-Host "  Saved: $([System.IO.Path]::GetFileName($serverReportPath))" -ForegroundColor Green
+
     $allServerSummaries.Add([PSCustomObject]@{
         ServerName = $serverName
         Criticality = $criticality
         Score = $criticalScore
         Role = $role
-        Workloads = $workloads.Count
+        Decision = $decision
+        GoStatus = $goStatus
+        Blockers = $blockerCount
+        Risks = $riskCount
+        Workloads = $workloadCount
         Users = $userCount
         ReportFile = $serverReportPath
-        HasDiscovery = ($files.Discovery -ne $null)
-        HasReadiness = ($files.Readiness -ne $null)
     })
 }
 
-Write-Progress -Activity "Processing Servers" -Completed
-
-# Generate Master Summary Report
+Write-Progress -Activity 'Processing Servers' -Completed
 Write-Host "`nGenerating master summary report..." -ForegroundColor White
 
 $masterReport = New-Object 'System.Collections.Generic.List[string]'
-
-$masterReport.Add("# Master Summary - Server Upgrade Readiness")
-$masterReport.Add("")
+$masterReport.Add('# Master Change Summary - Server Upgrade Readiness')
+$masterReport.Add('')
 $masterReport.Add("**Generated:** $reportDate  ")
 $masterReport.Add("**Total Servers:** $($allServerSummaries.Count)  ")
 $masterReport.Add("**Analysis Period:** Last $DaysBack days")
-$masterReport.Add("")
-$masterReport.Add("---")
-$masterReport.Add("")
+$masterReport.Add('')
 
-# Summary statistics
-$critCount = ($allServerSummaries | Where-Object { $_.Criticality -eq 'CRITICAL' }).Count
-$highCount = ($allServerSummaries | Where-Object { $_.Criticality -eq 'HIGH' }).Count
-$medCount = ($allServerSummaries | Where-Object { $_.Criticality -eq 'MEDIUM' }).Count
-$lowCount = ($allServerSummaries | Where-Object { $_.Criticality -eq 'LOW' }).Count
+$masterReport.Add('## Approval Snapshot')
+$masterReport.Add('')
+$masterReport.Add('| Server | Role | Criticality | Score | Decision | Blockers | Risks/Gaps | Workloads | Users | Report |')
+$masterReport.Add('|--------|------|-------------|-------|----------|----------|------------|-----------|-------|--------|')
 
-$masterReport.Add("## Environment Overview")
-$masterReport.Add("")
-$masterReport.Add("### Criticality Distribution")
-$masterReport.Add("")
-$masterReport.Add("| Level | Count | Percentage |")
-$masterReport.Add("|-------|-------|------------|")
-
-$total = $allServerSummaries.Count
-if ($total -gt 0) {
-    $masterReport.Add("| CRITICAL | $critCount | $([math]::Round(($critCount/$total)*100,1))% |")
-    $masterReport.Add("| HIGH | $highCount | $([math]::Round(($highCount/$total)*100,1))% |")
-    $masterReport.Add("| MEDIUM | $medCount | $([math]::Round(($medCount/$total)*100,1))% |")
-    $masterReport.Add("| LOW | $lowCount | $([math]::Round(($lowCount/$total)*100,1))% |")
-}
-$masterReport.Add("")
-
-# Server priority table
-$masterReport.Add("## Server Priority List")
-$masterReport.Add("")
-$masterReport.Add("Servers ranked by criticality (highest first):")
-$masterReport.Add("")
-$masterReport.Add("| Priority | Server | Criticality | Score | Role | Workloads | Users | Report |")
-$masterReport.Add("|----------|--------|-------------|-------|------|-----------|-------|--------|")
-
-$sortedServers = $allServerSummaries | Sort-Object Score -Descending
-$priority = 1
-foreach ($srv in $sortedServers) {
+foreach ($srv in $allServerSummaries | Sort-Object Score -Descending) {
     $reportFileName = [System.IO.Path]::GetFileName($srv.ReportFile)
-    $masterReport.Add("| $priority | $($srv.ServerName) | $($srv.Criticality) | $($srv.Score) | $($srv.Role) | $($srv.Workloads) | $($srv.Users) | [$($srv.ServerName)]($reportFileName) |")
-    $priority++
+    $masterReport.Add("| $($srv.ServerName) | $($srv.Role) | $($srv.Criticality) | $($srv.Score) | $($srv.Decision) | $($srv.Blockers) | $($srv.Risks) | $($srv.Workloads) | $($srv.Users) | [$($srv.ServerName)]($reportFileName) |")
 }
-$masterReport.Add("")
+$masterReport.Add('')
 
-# Phased upgrade plan
-$masterReport.Add("## Recommended Upgrade Phases")
-$masterReport.Add("")
-
-if ($lowCount -gt 0) {
-    $masterReport.Add("### Phase 1 - LOW Priority (Pilot)")
-    $masterReport.Add("")
-    $lowServers = $sortedServers | Where-Object { $_.Criticality -eq 'LOW' } | Select-Object -ExpandProperty ServerName
-    $masterReport.Add("**Servers:** $($lowServers -join ', ')")
-    $masterReport.Add("")
-    $masterReport.Add("- Validate upgrade process")
-    $masterReport.Add("- Identify issues early")
-    $masterReport.Add("- Build confidence")
-    $masterReport.Add("")
-}
-
-if ($medCount -gt 0) {
-    $masterReport.Add("### Phase 2 - MEDIUM Priority")
-    $medServers = $sortedServers | Where-Object { $_.Criticality -eq 'MEDIUM' } | Select-Object -ExpandProperty ServerName
-    $masterReport.Add("**Servers:** $($medServers -join ', ')")
-    $masterReport.Add("")
-    $masterReport.Add("- Standard production upgrades")
-    $masterReport.Add("- Use validated process")
-    $masterReport.Add("")
-}
-
-if ($highCount -gt 0) {
-    $masterReport.Add("### Phase 3 - HIGH Priority")
-    $highServers = $sortedServers | Where-Object { $_.Criticality -eq 'HIGH' } | Select-Object -ExpandProperty ServerName
-    $masterReport.Add("**Servers:** $($highServers -join ', ')")
-    $masterReport.Add("")
-    $masterReport.Add("- Important workloads")
-    $masterReport.Add("- Extra testing recommended")
-    $masterReport.Add("")
-}
-
-if ($critCount -gt 0) {
-    $masterReport.Add("### Phase 4 - CRITICAL Priority")
-    $critServers = $sortedServers | Where-Object { $_.Criticality -eq 'CRITICAL' } | Select-Object -ExpandProperty ServerName
-    $masterReport.Add("**Servers:** $($critServers -join ', ')")
-    $masterReport.Add("")
-    $masterReport.Add("- Mission-critical systems")
-    $masterReport.Add("- Maximum planning and testing")
-    $masterReport.Add("- Maintenance windows required")
-    $masterReport.Add("")
-}
-
-# Per-server links
-$masterReport.Add("## Individual Server Reports")
-$masterReport.Add("")
-$masterReport.Add("Detailed consolidated reports for each server:")
-$masterReport.Add("")
-
-foreach ($srv in $sortedServers) {
-    $reportFileName = [System.IO.Path]::GetFileName($srv.ReportFile)
-    $dataTypes = @()
-    if ($srv.HasDiscovery) { $dataTypes += "Discovery" }
-    if ($srv.HasReadiness) { $dataTypes += "Readiness" }
-    
-    $masterReport.Add("- [$($srv.ServerName)]($reportFileName) - $($srv.Criticality) priority - $($dataTypes -join ' + ')")
-}
-$masterReport.Add("")
-
-# Save master report
-$masterPath = Join-Path $OutputDirectory "MASTER-Summary_${timestamp}.md"
+$masterPath = Join-Path $OutputDirectory "MASTER-ChangeSummary_${timestamp}.md"
 $masterReport | Out-File -FilePath $masterPath -Encoding UTF8
 
-Write-Host "`n✓ Master report saved: $([System.IO.Path]::GetFileName($masterPath))" -ForegroundColor Green
-Write-Host "`n📊 Summary:" -ForegroundColor Cyan
+Write-Host "`nMaster report saved: $([System.IO.Path]::GetFileName($masterPath))" -ForegroundColor Green
+Write-Host 'Summary:' -ForegroundColor Cyan
 Write-Host "   Per-server reports: $($allServerSummaries.Count)" -ForegroundColor White
-Write-Host "   CRITICAL priority: $critCount" -ForegroundColor Red
-Write-Host "   HIGH priority: $highCount" -ForegroundColor Yellow
-Write-Host "   MEDIUM priority: $medCount" -ForegroundColor Gray
-Write-Host "   LOW priority: $lowCount" -ForegroundColor Gray
-Write-Host "`n📁 All reports saved to: $OutputDirectory" -ForegroundColor Cyan
+Write-Host "All reports saved to: $OutputDirectory" -ForegroundColor Cyan
