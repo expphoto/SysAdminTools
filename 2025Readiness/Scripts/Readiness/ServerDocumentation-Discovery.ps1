@@ -1281,16 +1281,17 @@ function Export-MarkdownReport {
         $md.Add("|------|-------|----------|")
         foreach ($site in $details.Sites | Select-Object -First 10) {
             $bindings = ""
-            if ($site.Bindings -and $site.Bindings.Count -gt 0) {
-                $bindings = ($site.Bindings | Where-Object { $_ -and $_.PSObject.Properties['BindingInformation'] } | ForEach-Object { $_.BindingInformation }) -join ', '
+            $siteBindings = @($site.Bindings)
+            if ($siteBindings.Count -gt 0) {
+                $bindings = ($siteBindings | Where-Object { $_ -and $_.PSObject.Properties['BindingInformation'] } | ForEach-Object { $_.BindingInformation }) -join ', '
             }
             if ([string]::IsNullOrWhiteSpace($bindings)) {
                 $bindings = "No bindings"
             }
             $md.Add("| $($site.Name) | $($site.State) | $bindings |")
         }
-        if ($details.Sites.Count -gt 10) {
-            $md.Add("| *... and $($details.Sites.Count - 10) more sites* | | |")
+        if (@($details.Sites).Count -gt 10) {
+            $md.Add("| *... and $(@($details.Sites).Count - 10) more sites* | | |")
         }
         $md.Add("")
         
@@ -1298,7 +1299,7 @@ function Export-MarkdownReport {
         $md.Add("")
         $md.Add("| Site/Application | Application Pool | Virtual Path | Physical Path |")
         $md.Add("|------------------|------------------|--------------|---------------|")
-        foreach ($app in $details.Applications | Select-Object -First 10) {
+        foreach ($app in @($details.Applications) | Select-Object -First 10) {
             $siteName = if ($app.SiteName) { $app.SiteName } else { "Unknown" }
             $appPath = if ($app.Path) { $app.Path } else { "/" }
             $siteApp = "$siteName$appPath"
@@ -1306,8 +1307,8 @@ function Export-MarkdownReport {
             $physicalPath = if ($app.PhysicalPath) { $app.PhysicalPath } else { "Not configured" }
             $md.Add("| $siteApp | $appPool | $appPath | $physicalPath |")
         }
-        if ($details.Applications.Count -gt 10) {
-            $md.Add("| *... and $($details.Applications.Count - 10) more applications* | | | |")
+        if (@($details.Applications).Count -gt 10) {
+            $md.Add("| *... and $(@($details.Applications).Count - 10) more applications* | | | |")
         }
         $md.Add("")
         
@@ -1315,38 +1316,38 @@ function Export-MarkdownReport {
         $md.Add("")
         $md.Add("| Name | .NET CLR Version | Pipeline Mode | State |")
         $md.Add("|------|------------------|---------------|-------|")
-        foreach ($pool in $details.AppPools | Select-Object -First 10) {
+        foreach ($pool in @($details.AppPools) | Select-Object -First 10) {
             $poolName = if ($pool.Name) { $pool.Name } else { "Unknown" }
             $dotNetVer = if ($pool.dotNetVersion) { $pool.dotNetVersion } else { "N/A" }
             $pipeline = if ($pool.pipelineMode) { $pool.pipelineMode } else { "Integrated" }
             $state = if ($pool.Value) { $pool.Value } else { "Unknown" }
             $md.Add("| $poolName | $dotNetVer | $pipeline | $state |")
         }
-        if ($details.AppPools.Count -gt 10) {
-            $md.Add("| *... and $($details.AppPools.Count - 10) more app pools* | | | |")
+        if (@($details.AppPools).Count -gt 10) {
+            $md.Add("| *... and $(@($details.AppPools).Count - 10) more app pools* | | | |")
         }
         $md.Add("")
         
         $md.Add("### Activity Summary")
         $md.Add("")
         $md.Add("- **Total Sites:** $($details.TotalSites)")
-        $md.Add("- **Started Sites:** $($details.ActiveSites.Count)")
+        $md.Add("- **Started Sites:** $(@($details.ActiveSites).Count)")
         $md.Add("- **Total Applications:** $($details.TotalApplications)")
-        $md.Add("- **Active Applications (in started sites):** $($details.ActiveApplications.Count)")
+        $md.Add("- **Active Applications (in started sites):** $(@($details.ActiveApplications).Count)")
         $md.Add("- **Total App Pools:** $($details.TotalAppPools)")
-        $md.Add("- **Running App Pools:** $($details.AppPools | Where-Object { $_.Value -eq 'Started' }).Count")
+        $md.Add("- **Running App Pools:** $(@(if ($details.AppPools) { $details.AppPools | Where-Object { $_.Value -eq 'Started' } }).Count)")
         $md.Add("- **Recent Log Entries Sampled:** $($details.RecentLogEntries)")
         $md.Add("- **Log Activity Level:** $($details.LogActivityLevel)")
         $md.Add("")
         
         # Show warnings for inactive sites/apps
-        $inactiveSites = $details.TotalSites - $details.ActiveSites.Count
+        $inactiveSites = $details.TotalSites - @($details.ActiveSites).Count
         if ($inactiveSites -gt 0) {
             $md.Add("**Warning:** $inactiveSites site(s) are not started. Verify if they should be running.")
             $md.Add("")
         }
         
-        $inactiveApps = $details.TotalApplications - $details.ActiveApplications.Count
+        $inactiveApps = $details.TotalApplications - @($details.ActiveApplications).Count
         if ($inactiveApps -gt 0) {
             $md.Add("**Note:** $inactiveApps application(s) exist in stopped sites or are not active. Review for cleanup.")
             $md.Add("")
