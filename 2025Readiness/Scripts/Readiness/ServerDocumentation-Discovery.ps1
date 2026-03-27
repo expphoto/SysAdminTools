@@ -1394,8 +1394,8 @@ function Export-MarkdownReport {
         $md.Add("|------|------------------|---------------|-------|")
         foreach ($pool in @($details.AppPools) | Select-Object -First 10) {
             $poolName = if ($pool.Name) { $pool.Name } else { "Unknown" }
-            $dotNetVer = if ($pool.dotNetVersion) { $pool.dotNetVersion } else { "N/A" }
-            $pipeline = if ($pool.pipelineMode) { $pool.pipelineMode } else { "Integrated" }
+            $dotNetVer = if ($pool.PSObject.Properties['dotNetVersion'] -and $pool.dotNetVersion) { $pool.dotNetVersion } else { "N/A" }
+            $pipeline = if ($pool.PSObject.Properties['pipelineMode'] -and $pool.pipelineMode) { $pool.pipelineMode } else { "N/A" }
             $state = if ($pool.Value) { $pool.Value } else { "Unknown" }
             $md.Add("| $poolName | $dotNetVer | $pipeline | $state |")
         }
