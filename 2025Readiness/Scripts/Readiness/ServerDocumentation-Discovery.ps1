@@ -527,9 +527,113 @@ function Invoke-WorkloadDetection {
     # Web Server
     if ($script:ServerProfile.DetectedRoles -contains 'WebServer') {
         $sites = @()
+        $apps = @()
+        $appPools = @()
+        $vdirs = @()
+        $iisDetails = @{
+            Sites = @()
+            Applications = @()
+            AppPools = @()
+            VirtualDirectories = @()
+            TotalSites = 0
+            TotalApplications = 0
+            TotalAppPools = 0
+            TotalVDirs = 0
+            RecentLogEntries = 0
+            LogActivityLevel = 'None'
+            ActiveSites = @()
+            ActiveApplications = @()
+        }
+
         if (Get-Command -Name Get-Website -ErrorAction SilentlyContinue) {
             $sites = @(Get-Website -ErrorAction SilentlyContinue)
+            $iisDetails.Sites = $sites
+            $iisDetails.TotalSites = $sites.Count
         }
+
+        if (Get-Command -Name Get-WebApplication -ErrorAction SilentlyContinue) {
+            $apps = @(Get-WebApplication -ErrorAction SilentlyContinue)
+            $iisDetails.Applications = $apps
+            $iisDetails.TotalApplications = $apps.Count
+        }
+
+        if (Get-Command -Name Get-WebAppPoolState -ErrorAction SilentlyContinue) {
+            $appPools = @(Get-WebAppPoolState -ErrorAction SilentlyContinue)
+            $iisDetails.AppPools = $appPools
+            $iisDetails.TotalAppPools = $appPools.Count
+        }
+
+        if (Get-Command -Name Get-WebVirtualDirectory -ErrorAction SilentlyContinue) {
+            $vdirs = @(Get-WebVirtualDirectory -ErrorAction SilentlyContinue)
+            $iisDetails.VirtualDirectories = $vdirs
+            $iisDetails.TotalVDirs = $vdirs.Count
+        }
+
+        # Try to sample IIS logs for activity
+        $iisActivity = 0
+        $iisLogPath = 'C:\inetpub\logs\LogFiles'
+        if (Test-Path $iisLogPath) {
+            try {
+                $recentLogs = @(Get-ChildItem -Path $iisLogPath -Recurse -Filter '*.log' -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -gt $script:WindowStart } |
+                    Select-Object -First 3)
+
+                foreach ($log in $recentLogs) {
+                    $lineCount = @(Get-Content $log.FullName -TotalCount 100 -ErrorAction SilentlyContinue).Count
+                    $iisActivity += $lineCount
+                }
+            } catch {
+                Write-Verbose "Could not sample IIS logs"
+            }
+        }
+
+        # Determine confidence and criticality based on actual usage
+        $activeSites = @()
+        $activeApps = @()
+
+        # Check sites that are started
+        foreach ($site in $sites) {
+            if ($site.State -eq 'Started') {
+                $activeSites += $site.Name
+            }
+        }
+
+        # Check applications in started sites
+        foreach ($app in $apps) {
+            # Get the site name for this application
+            $siteName = $app.ItemXPath.Split('/')[1].Split('=')[1]
+            $siteObj = $sites | Where-Object { $_.Name -eq $siteName }
+            if ($siteObj -and $siteObj.State -eq 'Started') {
+                $activeApps += "$siteName/$($app.Path)"
+            }
+        }
+
+        # Check app pools that are started
+        $runningAppPools = $appPools | Where-Object { $_.Value -eq 'Started' }
+
+        $iisDetails.ActiveSites = $activeSites
+        $iisDetails.ActiveApplications = $activeApps
+        $iisDetails.RecentLogEntries = $iisActivity
+        $iisDetails.LogActivityLevel = if ($iisActivity -gt 1000) { 'High' } elseif ($iisActivity -gt 100) { 'Moderate' } elseif ($iisActivity -gt 0) { 'Low' } else { 'None' }
+
+        $confidence = if ($iisActivity -gt 100 -or $activeSites.Count -gt 0) { 'High' } else { 'Medium' }
+        $criticality = if ($iisActivity -gt 1000 -or $activeSites.Count -gt 2) { 'HIGH' } elseif ($iisActivity -gt 100 -or $activeSites.Count -gt 0) { 'HIGH' } else { 'MEDIUM' }
+
+        $script:ActiveWorkloads.Add([PSCustomObject]@{
+            Type = 'Web Server (IIS)'
+            Confidence = $confidence
+            Evidence = "$($sites.Count) sites ($($activeSites.Count) started), $($apps.Count) applications ($($activeApps.Count) active in started sites), $($appPools.Count) app pools ($($runningAppPools.Count) running), sampled $iisActivity recent log entries"
+            Criticality = $criticality
+            TestScenario = 'Test website access, application pools, SSL certificates'
+            Details = $iisDetails
+        })
+
+        if ($iisActivity -gt 1000 -or $activeSites.Count -gt 2) {
+            $script:CriticalityScore += 30
+        } elseif ($iisActivity -gt 100 -or $activeSites.Count -gt 0) {
+            $script:CriticalityScore += 15
+        }
+    }
 
         # Try to sample IIS logs for activity
         $iisActivity = 0
@@ -1065,10 +1169,28 @@ function Export-MarkdownReport {
                 $md.Add("  - Verify backup completion within last 24 hours")
                 $md.Add("  - Test database connectivity from application servers")
             }
-            if ($workload.Type -eq 'Web Server (IIS)') {
+            if ($workload.Type -eq 'Web Server (IIS)' -and $workload.Details) {
+                $details = $workload.Details
                 $md.Add("  - Test all published websites")
+                $md.Add("    - Started Sites to Test: $(($details.ActiveSites | Select-Object -First 5) -join ', ')")
+                if ($details.ActiveSites.Count -gt 5) {
+                    $md.Add("    - *... and $($details.ActiveSites.Count - 5) more started sites*")
+                }
+                
+                $stoppedSites = $details.TotalSites - $details.ActiveSites.Count
+                if ($stoppedSites -gt 0) {
+                    $md.Add("    - **Note:** $stoppedSites site(s) are not started - verify if they should be")
+                }
+                
                 $md.Add("  - Verify SSL certificates are valid")
                 $md.Add("  - Check application pool health and auto-restart settings")
+                $md.Add("    - App Pools: $($details.TotalAppPools) total, $(($details.AppPools | Where-Object { $_.Value -eq 'Started' }).Count) running")
+                if ($details.ActiveApplications.Count -gt 0) {
+                    $md.Add("    - Active Applications: $(($details.ActiveApplications | Select-Object -First 5) -join ', ')")
+                }
+                if ($details.RecentLogEntries -eq 0) {
+                    $md.Add("  - **WARNING:** No recent IIS log activity - verify sites are serving traffic")
+                }
                 $md.Add("  - Review IIS logs for errors")
             }
             if ($workload.Type -eq 'DHCP Server' -and $workload.Details) {
@@ -1191,6 +1313,76 @@ function Export-MarkdownReport {
         }
     }
 
+    # Web Server Details (if applicable)
+    $webWorkload = $script:ActiveWorkloads | Where-Object { $_.Type -eq 'Web Server (IIS)' }
+    if ($webWorkload -and $webWorkload.Details) {
+        $details = $webWorkload.Details
+        $md.Add("## IIS Web Server Details")
+        $md.Add("")
+        $md.Add("### Sites")
+        $md.Add("")
+        $md.Add("| Name | State | Bindings |")
+        $md.Add("|------|-------|----------|")
+        foreach ($site in $details.Sites | Select-Object -First 10) {
+            $bindings = ($site.Bindings | ForEach-Object { $_.BindingInformation }) -join ', '
+            $md.Add("| $($site.Name) | $($site.State) | $bindings |")
+        }
+        if ($details.Sites.Count -gt 10) {
+            $md.Add("| *... and $($details.Sites.Count - 10) more sites* | | |")
+        }
+        $md.Add("")
+        
+        $md.Add("### Applications")
+        $md.Add("")
+        $md.Add("| Site/Application | Application Pool | Virtual Path | Physical Path |")
+        $md.Add("|------------------|------------------|--------------|---------------|")
+        foreach ($app in $details.Applications | Select-Object -First 10) {
+            $siteApp = "$($app.SiteName)$($app.Path)"
+            $md.Add("| $siteApp | $($app.ApplicationPool) | $($app.Path) | $($app.PhysicalPath) |")
+        }
+        if ($details.Applications.Count -gt 10) {
+            $md.Add("| *... and $($details.Applications.Count - 10) more applications* | | | |")
+        }
+        $md.Add("")
+        
+        $md.Add("### Application Pools")
+        $md.Add("")
+        $md.Add("| Name | .NET CLR Version | Pipeline Mode | State |")
+        $md.Add("|------|------------------|---------------|-------|")
+        foreach ($pool in $details.AppPools | Select-Object -First 10) {
+            $md.Add("| $($pool.Name) | $($pool.dotNetVersion) | $($pool.pipelineMode) | $($pool.Value) |")
+        }
+        if ($details.AppPools.Count -gt 10) {
+            $md.Add("| *... and $($details.AppPools.Count - 10) more app pools* | | | |")
+        }
+        $md.Add("")
+        
+        $md.Add("### Activity Summary")
+        $md.Add("")
+        $md.Add("- **Total Sites:** $($details.TotalSites)")
+        $md.Add("- **Started Sites:** $($details.ActiveSites.Count)")
+        $md.Add("- **Total Applications:** $($details.TotalApplications)")
+        $md.Add("- **Active Applications (in started sites):** $($details.ActiveApplications.Count)")
+        $md.Add("- **Total App Pools:** $($details.TotalAppPools)")
+        $md.Add("- **Running App Pools:** $($details.AppPools | Where-Object { $_.Value -eq 'Started' }).Count")
+        $md.Add("- **Recent Log Entries Sampled:** $($details.RecentLogEntries)")
+        $md.Add("- **Log Activity Level:** $($details.LogActivityLevel)")
+        $md.Add("")
+        
+        # Show warnings for inactive sites/apps
+        $inactiveSites = $details.TotalSites - $details.ActiveSites.Count
+        if ($inactiveSites -gt 0) {
+            $md.Add("**Warning:** $inactiveSites site(s) are not started. Verify if they should be running.")
+            $md.Add("")
+        }
+        
+        $inactiveApps = $details.TotalApplications - $details.ActiveApplications.Count
+        if ($inactiveApps -gt 0) {
+            $md.Add("**Note:** $inactiveApps application(s) exist in stopped sites or are not active. Review for cleanup.")
+            $md.Add("")
+        }
+    }
+
     # Active Applications with enhanced details
     if ($script:Applications.Count -gt 0) {
         $md.Add("## Active Applications")
@@ -1286,9 +1478,7 @@ function Export-CsvReports {
                     $detailSummary = "$($workload.Details.ActivePrinters) active, $($workload.Details.RecentPrintJobs) recent jobs"
                 }
                 'Web Server (IIS)' {
-                    if ($workload.Evidence -match '(\d+) recent log entries') {
-                        $detailSummary = "$($Matches[1]) log entries"
-                    }
+                    $detailSummary = "$($workload.Details.ActiveSites.Count)/$($workload.Details.TotalSites) sites started, $($workload.Details.TotalAppPools) app pools, $($workload.Details.RecentLogEntries) log entries"
                 }
             }
         }
@@ -1419,14 +1609,25 @@ try {
     
     # Show Web Server activity if applicable
     $webWorkload = $script:ActiveWorkloads | Where-Object { $_.Type -eq 'Web Server (IIS)' }
-    if ($webWorkload) {
-        # Extract log entries from evidence string
-        if ($webWorkload.Evidence -match '(\d+) recent log entries') {
-            $logEntries = $Matches[1]
-            Write-Host "Web Server: $($Matches[1]) recent log entries" -ForegroundColor White
-            if ([int]$logEntries -eq 0) {
-                Write-Host "  WARNING: No recent IIS log activity detected" -ForegroundColor Yellow
-            }
+    if ($webWorkload -and $webWorkload.Details) {
+        $details = $webWorkload.Details
+        $runningPools = ($details.AppPools | Where-Object { $_.Value -eq 'Started' }).Count
+        Write-Host "Web Server: $($details.TotalSites) sites ($($details.ActiveSites.Count) started), $($details.TotalApplications) applications, $($details.TotalAppPools) app pools ($runningPools running)" -ForegroundColor White
+        Write-Host "  Recent Log Entries: $($details.RecentLogEntries), Activity Level: $($details.LogActivityLevel)" -ForegroundColor Gray
+        
+        if ($details.RecentLogEntries -eq 0) {
+            Write-Host "  WARNING: No recent IIS log activity detected" -ForegroundColor Yellow
+        }
+        
+        # Show started sites
+        if ($details.ActiveSites.Count -gt 0) {
+            Write-Host "  Started Sites: $(($details.ActiveSites | Select-Object -First 5) -join ', ')" -ForegroundColor Gray
+        }
+        
+        # Show stopped sites warning
+        $stoppedSites = $details.TotalSites - $details.ActiveSites.Count
+        if ($stoppedSites -gt 0) {
+            Write-Host "  WARNING: $stoppedSites site(s) are not started" -ForegroundColor Yellow
         }
     }
     
