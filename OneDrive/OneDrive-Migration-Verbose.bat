@@ -47,30 +47,36 @@ echo [%DATE% %TIME%] ===== STEP 0: ENFORCE ONEDRIVE KFM ===== >> "%LOG_FILE%"
 
 REM Paste your Tenant GUID between the quotes below on the live version
 set "TENANT_ID=<PASTE_TENANT_GUID_HERE>"
-set "SCRIPT_DIR=%~dp0"
-set "COMPLETE_PS1=%SCRIPT_DIR%Complete-OneDrive-Migration.ps1"
+set "KFM_POLICY_WRITTEN=0"
 
 if /I "%TENANT_ID%"=="<PASTE_TENANT_GUID_HERE>" (
     echo   - No TenantID provided; skipping KFM policy configuration
     echo [%DATE% %TIME%] Skipping KFM policy: TENANT_ID not set >> "%LOG_FILE%"
 ) else (
-    if exist "%COMPLETE_PS1%" (
-        echo   - Applying KFM policy via PowerShell script
-        echo [%DATE% %TIME%] Running PS1: "%COMPLETE_PS1%" -TenantID %TENANT_ID% -SkipDataMigration >> "%LOG_FILE%"
-        powershell -NoProfile -ExecutionPolicy Bypass -File "%COMPLETE_PS1%" -TenantID %TENANT_ID% -SkipDataMigration
-        set "PS1_EXIT=%errorlevel%"
-        echo [%DATE% %TIME%] Complete-OneDrive-Migration.ps1 exit code: !PS1_EXIT! >> "%LOG_FILE%"
-        if not "!PS1_EXIT!"=="0" (
-            echo   - WARNING: KFM policy script exited with code %PS1_EXIT%
-            echo [%DATE% %TIME%] WARNING: KFM policy script non-zero exit >> "%LOG_FILE%"
-        ) else (
-            echo   - KFM policy applied successfully
-            echo [%DATE% %TIME%] KFM policy applied successfully >> "%LOG_FILE%"
-        )
+    echo   - Applying KFM silent opt-in policy directly via registry...
+    echo [%DATE% %TIME%] Writing OneDrive KFM policy values to HKLM\SOFTWARE\Policies\Microsoft\OneDrive >> "%LOG_FILE%"
+
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\OneDrive" /f >nul 2>&1
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\OneDrive" /v "KFMSilentOptIn" /t REG_SZ /d "%TENANT_ID%" /f >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "KFM_POLICY_WRITTEN=1"
+        echo [%DATE% %TIME%] SUCCESS: KFMSilentOptIn written for tenant %TENANT_ID% >> "%LOG_FILE%"
     ) else (
-        echo   - PowerShell helper script not found: %COMPLETE_PS1%
-        echo [%DATE% %TIME%] PS1 not found at %COMPLETE_PS1% >> "%LOG_FILE%"
+        echo   - WARNING: Failed to write KFMSilentOptIn; script may not be elevated
+        echo [%DATE% %TIME%] WARNING: Failed to write KFMSilentOptIn. Elevation may be required. >> "%LOG_FILE%"
     )
+
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\OneDrive" /v "KFMSilentOptInWithNotification" /t REG_DWORD /d 1 /f >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo [%DATE% %TIME%] SUCCESS: KFMSilentOptInWithNotification enabled >> "%LOG_FILE%"
+    ) else (
+        echo [%DATE% %TIME%] INFO: Could not set KFMSilentOptInWithNotification >> "%LOG_FILE%"
+    )
+
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\OneDrive" /v "KFMSilentOptInDesktop" /t REG_DWORD /d 1 /f >nul 2>&1
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\OneDrive" /v "KFMSilentOptInDocuments" /t REG_DWORD /d 1 /f >nul 2>&1
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\OneDrive" /v "KFMSilentOptInPictures" /t REG_DWORD /d 1 /f >nul 2>&1
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\OneDrive" /v "FilesOnDemandEnabled" /t REG_DWORD /d 1 /f >nul 2>&1
 )
 
 REM ===== STEP 1: FOLDER REDIRECTION CLEANUP =====
@@ -262,12 +268,9 @@ for /f "tokens=1" %%a in ('reg query "HKCU\SOFTWARE\Microsoft\OneDrive\Accounts"
         echo [%DATE% %TIME%] INFO: Videos KFM cache entry not found in %%a >> "%LOG_FILE%"
     )
     
-    REM Remove KFM configuration flags
-    reg delete "%%a\UserSettings" /v "KFMPersonalDesktop" /f >nul 2>&1
-    reg delete "%%a\UserSettings" /v "KFMPersonalDocuments" /f >nul 2>&1
-    reg delete "%%a\UserSettings" /v "KFMPersonalPictures" /f >nul 2>&1
-    reg delete "%%a\UserSettings" /v "KFMPersonalVideos" /f >nul 2>&1
-    reg delete "%%a\UserSettings" /v "KFMPersonalMusic" /f >nul 2>&1
+    REM Do not remove KFM configuration flags here.
+    REM Deleting KFMPersonal* values can clear OneDrive's current KFM state without providing a restore path.
+    echo [%DATE% %TIME%] INFO: Preserving existing KFMPersonal* values under %%a\UserSettings >> "%LOG_FILE%"
 )
 
 REM Clean up any remaining OneDrive folder redirection policies
@@ -593,6 +596,11 @@ timeout /t 5 /nobreak >nul
 
 REM Start OneDrive again
 echo   - Restarting OneDrive to apply changes...
+if "%KFM_POLICY_WRITTEN%"=="1" (
+    echo [%DATE% %TIME%] Restarting OneDrive with /reset to force KFM policy re-read: %ONEDRIVE_EXE% >> "%LOG_FILE%"
+    start "" "%ONEDRIVE_EXE%" /reset
+    timeout /t 15 /nobreak >nul
+)
 echo [%DATE% %TIME%] Restarting OneDrive from: %ONEDRIVE_EXE% >> "%LOG_FILE%"
 start "" "%ONEDRIVE_EXE%"
 timeout /t 5 /nobreak >nul
