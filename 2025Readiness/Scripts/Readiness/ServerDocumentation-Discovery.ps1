@@ -600,11 +600,16 @@ function Invoke-WorkloadDetection {
 
         # Check applications in started sites
         foreach ($app in $apps) {
-            # Get the site name for this application
-            $siteName = $app.ItemXPath.Split('/')[1].Split('=')[1]
-            $siteObj = $sites | Where-Object { $_.Name -eq $siteName }
-            if ($siteObj -and $siteObj.State -eq 'Started') {
-                $activeApps += "$siteName/$($app.Path)"
+            # Get the site name for this application from ItemXPath
+            $siteName = $null
+            if ($app.PSObject.Properties['ItemXPath'] -and $app.ItemXPath -match "site\[@name='([^']+)'\]") {
+                $siteName = $Matches[1]
+            }
+            if ($siteName) {
+                $siteObj = $sites | Where-Object { $_.Name -eq $siteName }
+                if ($siteObj -and $siteObj.State -eq 'Started') {
+                    $activeApps += "$siteName/$($app.Path)"
+                }
             }
         }
 
@@ -1306,7 +1311,10 @@ function Export-MarkdownReport {
                 $siteName = $app.SiteName
             } elseif ($app.PSObject.Properties['ItemXPath'] -and $app.ItemXPath) {
                 try {
-                    $siteName = $app.ItemXPath.Split('/')[1].Split('=')[1].Trim([char]39, [char]34)
+                    # Parse site name from ItemXPath using regex: /site[@name='SiteName']/...
+                    if ($app.ItemXPath -match "site\[@name='([^']+)'\]") {
+                        $siteName = $Matches[1]
+                    }
                 } catch {
                     $siteName = "Unknown"
                 }
