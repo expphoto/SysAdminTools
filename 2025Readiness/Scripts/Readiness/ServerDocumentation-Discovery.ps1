@@ -1280,7 +1280,13 @@ function Export-MarkdownReport {
         $md.Add("| Name | State | Bindings |")
         $md.Add("|------|-------|----------|")
         foreach ($site in $details.Sites | Select-Object -First 10) {
-            $bindings = ($site.Bindings | ForEach-Object { $_.BindingInformation }) -join ', '
+            $bindings = ""
+            if ($site.Bindings -and $site.Bindings.Count -gt 0) {
+                $bindings = ($site.Bindings | Where-Object { $_ -and $_.PSObject.Properties['BindingInformation'] } | ForEach-Object { $_.BindingInformation }) -join ', '
+            }
+            if ([string]::IsNullOrWhiteSpace($bindings)) {
+                $bindings = "No bindings"
+            }
             $md.Add("| $($site.Name) | $($site.State) | $bindings |")
         }
         if ($details.Sites.Count -gt 10) {
@@ -1293,8 +1299,12 @@ function Export-MarkdownReport {
         $md.Add("| Site/Application | Application Pool | Virtual Path | Physical Path |")
         $md.Add("|------------------|------------------|--------------|---------------|")
         foreach ($app in $details.Applications | Select-Object -First 10) {
-            $siteApp = "$($app.SiteName)$($app.Path)"
-            $md.Add("| $siteApp | $($app.ApplicationPool) | $($app.Path) | $($app.PhysicalPath) |")
+            $siteName = if ($app.SiteName) { $app.SiteName } else { "Unknown" }
+            $appPath = if ($app.Path) { $app.Path } else { "/" }
+            $siteApp = "$siteName$appPath"
+            $appPool = if ($app.ApplicationPool) { $app.ApplicationPool } else { "DefaultAppPool" }
+            $physicalPath = if ($app.PhysicalPath) { $app.PhysicalPath } else { "Not configured" }
+            $md.Add("| $siteApp | $appPool | $appPath | $physicalPath |")
         }
         if ($details.Applications.Count -gt 10) {
             $md.Add("| *... and $($details.Applications.Count - 10) more applications* | | | |")
@@ -1306,7 +1316,11 @@ function Export-MarkdownReport {
         $md.Add("| Name | .NET CLR Version | Pipeline Mode | State |")
         $md.Add("|------|------------------|---------------|-------|")
         foreach ($pool in $details.AppPools | Select-Object -First 10) {
-            $md.Add("| $($pool.Name) | $($pool.dotNetVersion) | $($pool.pipelineMode) | $($pool.Value) |")
+            $poolName = if ($pool.Name) { $pool.Name } else { "Unknown" }
+            $dotNetVer = if ($pool.dotNetVersion) { $pool.dotNetVersion } else { "N/A" }
+            $pipeline = if ($pool.pipelineMode) { $pool.pipelineMode } else { "Integrated" }
+            $state = if ($pool.Value) { $pool.Value } else { "Unknown" }
+            $md.Add("| $poolName | $dotNetVer | $pipeline | $state |")
         }
         if ($details.AppPools.Count -gt 10) {
             $md.Add("| *... and $($details.AppPools.Count - 10) more app pools* | | | |")
