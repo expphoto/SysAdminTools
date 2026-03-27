@@ -635,50 +635,6 @@ function Invoke-WorkloadDetection {
         }
     }
 
-        # Try to sample IIS logs for activity
-        $iisActivity = 0
-        $iisLogPath = 'C:\inetpub\logs\LogFiles'
-        if (Test-Path $iisLogPath) {
-            try {
-                $recentLogs = @(Get-ChildItem -Path $iisLogPath -Recurse -Filter '*.log' -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.LastWriteTime -gt $script:WindowStart } |
-                    Select-Object -First 3)
-
-                foreach ($log in $recentLogs) {
-                    $lineCount = @(Get-Content $log.FullName -TotalCount 100 -ErrorAction SilentlyContinue).Count
-                    $iisActivity += $lineCount
-                }
-            } catch {
-                Write-Verbose "Could not sample IIS logs"
-            }
-        }
-
-        $confidence = if ($iisActivity -gt 100) { 'High' } else { 'Medium' }
-        $criticality = if ($iisActivity -gt 1000) { 'HIGH' } else { 'MEDIUM' }
-
-        $iisDetails = @{
-            Sites = $sites
-            TotalSites = $sites.Count
-            RecentLogEntries = $iisActivity
-            LogActivityLevel = if ($iisActivity -gt 1000) { 'High' } elseif ($iisActivity -gt 100) { 'Moderate' } elseif ($iisActivity -gt 0) { 'Low' } else { 'None' }
-        }
-
-        $script:ActiveWorkloads.Add([PSCustomObject]@{
-            Type = 'Web Server (IIS)'
-            Confidence = $confidence
-            Evidence = "$($sites.Count) sites configured, sampled $iisActivity recent log entries"
-            Criticality = $criticality
-            TestScenario = 'Test website access, application pools, SSL certificates'
-            Details = $iisDetails
-        })
-
-        if ($iisActivity -gt 1000) {
-            $script:CriticalityScore += 30
-        } elseif ($iisActivity -gt 100) {
-            $script:CriticalityScore += 15
-        }
-    }
-
     # SQL Server
     if ($script:ServerProfile.DetectedRoles -contains 'SQLServer') {
         $sqlCriticality = 'MEDIUM'
