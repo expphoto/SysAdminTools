@@ -469,10 +469,14 @@ function Invoke-WorkloadDetection {
         }
     }
 
-    # File Server
+    # File Server - exclude admin shares and require activity
     if ($script:ServerProfile.DetectedRoles -contains 'FileServer') {
-        $shares = @(Get-SmbShare -Special $false -ErrorAction SilentlyContinue)
-        $shareCount = $shares.Count
+        $allShares = @(Get-SmbShare -Special $false -ErrorAction SilentlyContinue)
+        
+        # Filter out admin shares (C$, ADMIN$, IPC$, print$)
+        $adminShareNames = @('ADMIN$', 'C$', 'IPC$', 'print$', 'D$', 'E$', 'F$')
+        $userShares = $allShares | Where-Object { $adminShareNames -notcontains $_.Name }
+        $shareCount = @($userShares).Count
 
         # Check for actual share access via Security log (Event ID 5140 - file share access)
         $shareAccessEvents = @(Get-SafeEventLog -Filter @{
@@ -480,6 +484,16 @@ function Invoke-WorkloadDetection {
             Id = 5140
             StartTime = $script:WindowStart
         } -MaxEvents 500)
+
+        # Check for open files and sessions
+        $openFiles = @()
+        $activeSessions = @()
+        try {
+            $openFiles = @(Get-SmbOpenFile -ErrorAction SilentlyContinue)
+            $activeSessions = @(Get-SmbSession -ErrorAction SilentlyContinue)
+        } catch {
+            Write-Verbose "Could not query SMB open files or sessions"
+        }
 
         $activeShares = New-Object 'System.Collections.Generic.List[string]'
         $uniqueShareUsers = New-Object 'System.Collections.Generic.List[string]'
@@ -489,10 +503,13 @@ function Invoke-WorkloadDetection {
                 $shareName = ($xml.Event.EventData.Data | Where-Object { $_.Name -eq 'ShareName' }).'#text'
                 $userName = ($xml.Event.EventData.Data | Where-Object { $_.Name -eq 'SubjectUserName' }).'#text'
                 
-                if ($shareName -and $activeShares -notcontains $shareName) {
+                # Skip if share name is null or is an admin share
+                if ($shareName -and $adminShareNames -notcontains $shareName -and $activeShares -notcontains $shareName) {
                     $activeShares.Add($shareName)
                 }
-                if ($userName -and $userName -notmatch '\$' -and $uniqueShareUsers -notcontains $userName) {
+                if ($userName -and $userName -notmatch '\$' -and 
+                    $userName -notmatch '^(svc|system|administrator|guest|network service|local service)' -and
+                    $uniqueShareUsers -notcontains $userName) {
                     $uniqueShareUsers.Add($userName)
                 }
             } catch {
@@ -500,36 +517,54 @@ function Invoke-WorkloadDetection {
             }
         }
 
-        $shareActivityLevel = if ($shareAccessEvents.Count -eq 0) { 'No recent access detected' } 
-                              elseif ($shareAccessEvents.Count -lt 10) { 'Low activity' }
-                              elseif ($shareAccessEvents.Count -lt 100) { 'Moderate activity' }
-                              else { 'High activity' }
+        # Only flag as file server if there are user shares with activity or open files/sessions
+        $hasUserShareActivity = $activeShares.Count -gt 0
+        $hasOpenFiles = $openFiles.Count -gt 0
+        $hasActiveSessions = $activeSessions.Count -gt 0
+        
+        $isActiveFileServer = $shareCount -gt 0 -and ($hasUserShareActivity -or $hasOpenFiles -or $hasActiveSessions)
+
+        $shareActivityLevel = if (-not $isActiveFileServer) { 'No user share activity detected' }
+                        elseif ($shareAccessEvents.Count -lt 10) { 'Low activity' }
+                        elseif ($shareAccessEvents.Count -lt 100) { 'Moderate activity' }
+                        else { 'High activity' }
 
         $script:ServerProfile.ShareDetails = @{
-            TotalShares = $shareCount
+            TotalShares = $allShares.Count
+            UserShares = $shareCount
+            UserShareNames = @($userShares | Select-Object -ExpandProperty Name)
             ActiveShares = $activeShares.Count
             ActiveShareNames = $activeShares
             ShareAccessEvents = $shareAccessEvents.Count
             UniqueShareUsers = $uniqueShareUsers.Count
+            OpenFiles = $openFiles.Count
+            ActiveSessions = $activeSessions.Count
             ActivityLevel = $shareActivityLevel
+            IsActiveFileServer = $isActiveFileServer
         }
 
-        $confidence = if ($shareAccessEvents.Count -gt 0) { 'High' } else { 'Medium' }
-        $criticality = if ($shareAccessEvents.Count -gt 100) { 'HIGH' } elseif ($shareCount -gt 5) { 'HIGH' } else { 'MEDIUM' }
+        # Only consider it a real file server if there's user share activity
+        if ($isActiveFileServer) {
+            $confidence = if ($shareAccessEvents.Count -gt 0) { 'High' } else { 'Medium' }
+            $criticality = if ($shareAccessEvents.Count -gt 100 -or $shareCount -gt 5) { 'HIGH' } else { 'MEDIUM' }
 
-        $script:ActiveWorkloads.Add([PSCustomObject]@{
-            Type = 'File Server'
-            Confidence = $confidence
-            Evidence = "$shareCount shares published, $($activeShares.Count) actively accessed ($shareActivityLevel), $($uniqueShareUsers.Count) unique users"
-            Criticality = $criticality
-            TestScenario = 'Test file access, permissions, DFS if applicable'
-            Details = $script:ServerProfile.ShareDetails
-        })
+            $script:ActiveWorkloads.Add([PSCustomObject]@{
+                Type = 'File Server'
+                Confidence = $confidence
+                Evidence = "$shareCount user shares, $($activeShares.Count) actively accessed ($shareActivityLevel), $($openFiles.Count) open files, $($activeSessions.Count) sessions, $($uniqueShareUsers.Count) unique users"
+                Criticality = $criticality
+                TestScenario = 'Test file access, permissions, DFS if applicable'
+                Details = $script:ServerProfile.ShareDetails
+            })
 
-        if ($shareAccessEvents.Count -gt 100 -or $shareCount -gt 5) {
-            $script:CriticalityScore += 25
-        } else {
-            $script:CriticalityScore += 10
+            if ($shareAccessEvents.Count -gt 100 -or $shareCount -gt 5) {
+                $script:CriticalityScore += 25
+            } else {
+                $script:CriticalityScore += 10
+            }
+        } elseif ($shareCount -gt 0) {
+            # Has user shares but no activity - note it but don't flag as critical workload
+            Write-Verbose "Found $shareCount user shares but no recent activity detected"
         }
     }
 
