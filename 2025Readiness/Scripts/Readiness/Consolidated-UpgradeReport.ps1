@@ -12,6 +12,13 @@
     - Rollback and execution notes
 
     Also creates a master summary across all discovered servers.
+
+.NOTES
+    Corrected behavior:
+    - Defaults input/output to the current working directory
+    - Scans only the current folder (no recursion)
+    - Uses more tolerant filename parsing for server names
+    - Prefers newest matching file per server/type
 #>
 
 [CmdletBinding()]
@@ -139,11 +146,11 @@ function Get-ReadinessFindings {
 
     foreach ($match in $matches) {
         $findings.Add([PSCustomObject]@{
-            Name = $match.Groups[1].Value.Trim()
+            Name       = $match.Groups[1].Value.Trim()
             Confidence = $match.Groups[2].Value.Trim()
-            Evidence = $match.Groups[3].Value.Trim()
-            Why = $match.Groups[4].Value.Trim()
-            Action = $match.Groups[5].Value.Trim()
+            Evidence   = $match.Groups[3].Value.Trim()
+            Why        = $match.Groups[4].Value.Trim()
+            Action     = $match.Groups[5].Value.Trim()
         })
     }
 
@@ -159,34 +166,120 @@ function Get-ReadinessGapLines {
     return @(Get-BulletLines -SectionText $section)
 }
 
-if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $OutputDirectory = Join-Path $PSScriptRoot 'ConsolidatedReports'
+function Get-LogEvidenceFindings {
+    param(
+        [object[]]$Findings
+    )
+
+    if ($null -eq $Findings -or @($Findings).Count -eq 0) {
+        return @()
+    }
+
+    return @(
+        $Findings |
+        Where-Object {
+            $_.Evidence -match '(?i)\b(log|event|session|audit)\b'
+        }
+    )
 }
 
-if ([string]::IsNullOrWhiteSpace($InputDirectory)) {
-    Write-Host "`n== Server Reports Consolidation ==" -ForegroundColor Cyan
-    Write-Host "`nSelect the folder containing the generated markdown reports.`n" -ForegroundColor Gray
+function Get-ReadinessRowsFromJson {
+    param(
+        [System.IO.FileInfo]$File
+    )
+
+    if ($null -eq $File -or -not (Test-Path -LiteralPath $File.FullName)) {
+        return @()
+    }
 
     try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-        $dialog.Description = 'Select folder with readiness/discovery markdown reports'
-        $dialog.RootFolder = [System.Environment+SpecialFolder]::MyComputer
-        if (Test-Path $PSScriptRoot) {
-            $dialog.SelectedPath = $PSScriptRoot
+        $json = Get-Content -LiteralPath $File.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($json -is [System.Array]) {
+            return @($json)
         }
 
-        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            $InputDirectory = $dialog.SelectedPath
-        } else {
-            Write-Error 'No folder selected. Exiting.'
-            exit 1
-        }
+        return @($json)
     } catch {
-        Write-Host 'Enter folder path: ' -NoNewline -ForegroundColor Yellow
-        $InputDirectory = Read-Host
+        Write-Host "  [WARN] Could not parse readiness JSON: $($File.Name) - $($_.Exception.Message)" -ForegroundColor Yellow
+        return @()
     }
 }
+
+function Convert-ReadinessRowsToFindings {
+    param(
+        [object[]]$Rows,
+        [string]$UsageState
+    )
+
+    if ($null -eq $Rows -or @($Rows).Count -eq 0) {
+        return @()
+    }
+
+    return @(
+        foreach ($row in ($Rows | Where-Object {
+            $_.IsWS2025Change -eq $true -and
+            [string]$_.UsageState -eq $UsageState -and
+            [string]$_.Status -ne 'PASS'
+        })) {
+            [PSCustomObject]@{
+                Name       = [string]$row.Check
+                Confidence = [string]$row.BreakConfidence
+                Evidence   = [string]$row.Evidence
+                Why        = [string]$row.WS2025ChangeNote
+                Action     = [string]$row.Action
+            }
+        }
+    )
+}
+
+function Convert-ReadinessRowsToGapLines {
+    param(
+        [object[]]$Rows
+    )
+
+    if ($null -eq $Rows -or @($Rows).Count -eq 0) {
+        return @()
+    }
+
+    return @(
+        foreach ($row in ($Rows | Where-Object {
+            $_.IsWS2025Change -eq $true -and
+            [string]$_.UsageState -eq 'EvidenceGap' -and
+            [string]$_.Status -ne 'PASS'
+        })) {
+            $gap = New-Object 'System.Collections.Generic.List[string]'
+            $gap.Add("- $([string]$row.Check)")
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.Evidence)) {
+                $gap.Add("  Evidence: $([string]$row.Evidence)")
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.WS2025ChangeNote)) {
+                $gap.Add("  Why 2025: $([string]$row.WS2025ChangeNote)")
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.Action)) {
+                $gap.Add("  Action: $([string]$row.Action)")
+            }
+            $gap.ToArray()
+        }
+    )
+}
+
+$currentDirectory = (Get-Location).Path
+
+if ([string]::IsNullOrWhiteSpace($InputDirectory)) {
+    $InputDirectory = $currentDirectory
+}
+
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $OutputDirectory = $currentDirectory
+}
+
+Write-Host "`n==============================================================" -ForegroundColor Cyan
+Write-Host 'SERVER UPGRADE READINESS - CHANGE-READY REPORTS' -ForegroundColor Cyan
+Write-Host '==============================================================' -ForegroundColor Cyan
+
+Write-Host "`nInput directory : $InputDirectory" -ForegroundColor Gray
+Write-Host "Output directory: $OutputDirectory" -ForegroundColor Gray
+Write-Host "Scan mode       : Current folder only (no subfolders)" -ForegroundColor DarkGray
 
 if (-not (Test-Path $InputDirectory)) {
     Write-Error "Input directory not found: $InputDirectory"
@@ -194,62 +287,177 @@ if (-not (Test-Path $InputDirectory)) {
 }
 
 if (-not (Test-Path $OutputDirectory)) {
-    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+    Write-Host "`nCreating output directory: $OutputDirectory" -ForegroundColor Yellow
+    try {
+        New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+        Write-Host '  Created.' -ForegroundColor Green
+    } catch {
+        Write-Error "Could not create output directory: $($_.Exception.Message)"
+        exit 1
+    }
 }
 
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $reportDate = Get-Date -Format 'yyyy-MM-dd HH:mm'
 
-Write-Host "`n==============================================================" -ForegroundColor Cyan
-Write-Host 'SERVER UPGRADE READINESS - CHANGE-READY REPORTS' -ForegroundColor Cyan
-Write-Host '==============================================================' -ForegroundColor Cyan
-Write-Host "Input:  $InputDirectory" -ForegroundColor Gray
-Write-Host "Output: $OutputDirectory`n" -ForegroundColor Gray
-
+Write-Host "`n--------------------------------------------------------------" -ForegroundColor DarkGray
 Write-Host 'Scanning for server reports...' -ForegroundColor White
 
-$discoveryFiles = Get-ChildItem -Path $InputDirectory -Recurse -ErrorAction SilentlyContinue -File |
+# CURRENT FOLDER ONLY - NO RECURSION
+$discoveryFiles = @(
+    Get-ChildItem -Path $InputDirectory -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like 'ServerDocumentation_*.md' -or $_.Name -like 'ServerDoc_*.md' }
-$readinessFiles = Get-ChildItem -Path $InputDirectory -Recurse -ErrorAction SilentlyContinue -File |
-    Where-Object { $_.Name -like 'Readiness_*.md' -or $_.Name -like 'WS2025_ProductionReadiness_*.md' }
-$workloadFiles = Get-ChildItem -Path $InputDirectory -Filter 'Workloads_*.csv' -Recurse -ErrorAction SilentlyContinue
-$testPlanFiles = Get-ChildItem -Path $InputDirectory -Filter 'TestPlan_*.csv' -Recurse -ErrorAction SilentlyContinue
-$appFiles = Get-ChildItem -Path $InputDirectory -Filter 'Applications_*.csv' -Recurse -ErrorAction SilentlyContinue
+)
 
-Write-Host "  Found: $($discoveryFiles.Count) Discovery, $($readinessFiles.Count) Readiness, $($workloadFiles.Count) Workloads, $($testPlanFiles.Count) Test Plans, $($appFiles.Count) Apps" -ForegroundColor Gray
+$readinessFiles = @(
+    Get-ChildItem -Path $InputDirectory -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like 'Readiness_*.md' -or $_.Name -like 'WS2025_ProductionReadiness_*.md' }
+)
+
+$readinessJsonFiles = @(
+    Get-ChildItem -Path $InputDirectory -File -Filter 'WS2025_ProductionReadiness_*.json' -ErrorAction SilentlyContinue
+)
+
+$workloadFiles = @(
+    Get-ChildItem -Path $InputDirectory -File -Filter 'Workloads_*.csv' -ErrorAction SilentlyContinue
+)
+
+$testPlanFiles = @(
+    Get-ChildItem -Path $InputDirectory -File -Filter 'TestPlan_*.csv' -ErrorAction SilentlyContinue
+)
+
+$appFiles = @(
+    Get-ChildItem -Path $InputDirectory -File -Filter 'Applications_*.csv' -ErrorAction SilentlyContinue
+)
+
+Write-Host "  Discovery  (.md): $($discoveryFiles.Count) file(s)" -ForegroundColor $(if ($discoveryFiles.Count -gt 0) { 'Green' } else { 'Yellow' })
+foreach ($f in $discoveryFiles) { Write-Host "    $($f.Name)" -ForegroundColor DarkGray }
+
+Write-Host "  Readiness  (.md): $($readinessFiles.Count) file(s)" -ForegroundColor $(if ($readinessFiles.Count -gt 0) { 'Green' } else { 'Yellow' })
+foreach ($f in $readinessFiles) { Write-Host "    $($f.Name)" -ForegroundColor DarkGray }
+
+Write-Host "  Readiness (.json): $($readinessJsonFiles.Count) file(s)" -ForegroundColor $(if ($readinessJsonFiles.Count -gt 0) { 'Green' } else { 'DarkGray' })
+foreach ($f in $readinessJsonFiles) { Write-Host "    $($f.Name)" -ForegroundColor DarkGray }
+
+Write-Host "  Workloads  (.csv): $($workloadFiles.Count) file(s)" -ForegroundColor $(if ($workloadFiles.Count -gt 0) { 'Green' } else { 'DarkGray' })
+foreach ($f in $workloadFiles) { Write-Host "    $($f.Name)" -ForegroundColor DarkGray }
+
+Write-Host "  Test Plans (.csv): $($testPlanFiles.Count) file(s)" -ForegroundColor $(if ($testPlanFiles.Count -gt 0) { 'Green' } else { 'DarkGray' })
+foreach ($f in $testPlanFiles) { Write-Host "    $($f.Name)" -ForegroundColor DarkGray }
+
+Write-Host "  Apps       (.csv): $($appFiles.Count) file(s)" -ForegroundColor $(if ($appFiles.Count -gt 0) { 'Green' } else { 'DarkGray' })
+foreach ($f in $appFiles) { Write-Host "    $($f.Name)" -ForegroundColor DarkGray }
+
+if ($discoveryFiles.Count -eq 0 -and $readinessFiles.Count -eq 0) {
+    Write-Host "`n[!] No discovery or readiness files found in: $InputDirectory" -ForegroundColor Red
+    Write-Host '    Expected file name patterns:' -ForegroundColor Yellow
+    Write-Host '      ServerDoc_<SERVERNAME>_<yyyyMMdd>_<HHmmss>.md' -ForegroundColor Yellow
+    Write-Host '      WS2025_ProductionReadiness_<SERVERNAME>_<yyyyMMdd>_<HHmmss>_ChangeRequest.md' -ForegroundColor Yellow
+    Write-Host '    Only the current folder was scanned.' -ForegroundColor Yellow
+    exit 1
+}
 
 $serverData = @{}
 
-function Add-FileToServer($file, $type) {
-    if ($file.BaseName -match '_([A-Z0-9-]+)_[0-9]{8}_') {
-        $serverName = $Matches[1]
+function Get-ServerNameFromFile {
+    param(
+        [System.IO.FileInfo]$File
+    )
 
-        if (-not $serverData.ContainsKey($serverName)) {
-            $serverData[$serverName] = @{
-                Discovery = $null
-                Readiness = $null
-                Workloads = $null
-                TestPlan = $null
-                Applications = $null
-            }
+    $baseName = $File.BaseName
+
+    # Handle known multi-part prefixes before generic parsing.
+    if ($baseName -match '(?i)^WS2025_ProductionReadiness_(.+?)_[0-9]{8}_[0-9]{6}(?:_|$)') {
+        return $Matches[1].ToUpperInvariant()
+    }
+
+    if ($baseName -match '(?i)^ServerDocumentation_(.+?)_[0-9]{8}_[0-9]{6}(?:_|$)') {
+        return $Matches[1].ToUpperInvariant()
+    }
+
+    if ($baseName -match '(?i)^ServerDoc_(.+?)_[0-9]{8}_[0-9]{6}(?:_|$)') {
+        return $Matches[1].ToUpperInvariant()
+    }
+
+    # Preferred pattern: PREFIX_SERVERNAME_YYYYMMDD_HHMMSS...
+    if ($baseName -match '(?i)^[^_]+_(.+?)_[0-9]{8}_[0-9]{6}(?:_|$)') {
+        return $Matches[1].ToUpperInvariant()
+    }
+
+    # Fallback pattern: PREFIX_SERVERNAME_YYYYMMDD...
+    if ($baseName -match '(?i)^[^_]+_(.+?)_[0-9]{8}(?:_|$)') {
+        return $Matches[1].ToUpperInvariant()
+    }
+
+    # Fallback pattern: PREFIX_SERVERNAME
+    if ($baseName -match '(?i)^[^_]+_(.+)$') {
+        return $Matches[1].ToUpperInvariant()
+    }
+
+    return $null
+}
+
+function Add-FileToServer {
+    param(
+        [System.IO.FileInfo]$File,
+        [string]$Type
+    )
+
+    $serverName = Get-ServerNameFromFile -File $File
+
+    if ([string]::IsNullOrWhiteSpace($serverName)) {
+        Write-Host "  [SKIP] Could not extract server name from: $($File.Name)" -ForegroundColor Yellow
+        Write-Host "         Base name: $($File.BaseName)" -ForegroundColor DarkGray
+        return
+    }
+
+    if (-not $serverData.ContainsKey($serverName)) {
+        $serverData[$serverName] = @{
+            Discovery    = $null
+            Readiness    = $null
+            ReadinessJson = $null
+            Workloads    = $null
+            TestPlan     = $null
+            Applications = $null
         }
+    }
 
-        $serverData[$serverName][$type] = $file
+    # Prefer newest file for this server/type
+    if (
+        $null -eq $serverData[$serverName][$Type] -or
+        $File.LastWriteTime -gt $serverData[$serverName][$Type].LastWriteTime
+    ) {
+        $serverData[$serverName][$Type] = $File
     }
 }
 
-$discoveryFiles | ForEach-Object { Add-FileToServer $_ 'Discovery' }
-$readinessFiles | ForEach-Object { Add-FileToServer $_ 'Readiness' }
-$workloadFiles | ForEach-Object { Add-FileToServer $_ 'Workloads' }
-$testPlanFiles | ForEach-Object { Add-FileToServer $_ 'TestPlan' }
-$appFiles | ForEach-Object { Add-FileToServer $_ 'Applications' }
+Write-Host "`nMapping files to servers..." -ForegroundColor White
+$discoveryFiles | ForEach-Object { Add-FileToServer -File $_ -Type 'Discovery' }
+$readinessFiles | ForEach-Object { Add-FileToServer -File $_ -Type 'Readiness' }
+$readinessJsonFiles | ForEach-Object { Add-FileToServer -File $_ -Type 'ReadinessJson' }
+$workloadFiles  | ForEach-Object { Add-FileToServer -File $_ -Type 'Workloads' }
+$testPlanFiles  | ForEach-Object { Add-FileToServer -File $_ -Type 'TestPlan' }
+$appFiles       | ForEach-Object { Add-FileToServer -File $_ -Type 'Applications' }
 
-Write-Host "  Identified: $($serverData.Count) unique servers`n" -ForegroundColor White
+Write-Host "`nServers identified: $($serverData.Count)" -ForegroundColor $(if ($serverData.Count -gt 0) { 'Green' } else { 'Red' })
+foreach ($key in ($serverData.Keys | Sort-Object)) {
+    $entry = $serverData[$key]
+    $parts = @()
+    if ($entry.Discovery)    { $parts += 'Discovery' }
+    if ($entry.Readiness)    { $parts += 'Readiness' }
+    if ($entry.ReadinessJson) { $parts += 'ReadinessJson' }
+    if ($entry.Workloads)    { $parts += 'Workloads' }
+    if ($entry.TestPlan)     { $parts += 'TestPlan' }
+    if ($entry.Applications) { $parts += 'Apps' }
+    Write-Host ("  {0,-30} [{1}]" -f $key, ($parts -join ', ')) -ForegroundColor $(if ($parts.Count -ge 1) { 'White' } else { 'Yellow' })
+}
 
 if ($serverData.Count -eq 0) {
-    Write-Error 'No server reports found.'
+    Write-Error 'No server reports could be mapped. Check file naming in the current folder.'
     exit 1
 }
+
+Write-Host ''
 
 $allServerSummaries = New-Object 'System.Collections.Generic.List[object]'
 
@@ -260,7 +468,8 @@ foreach ($serverEntry in $serverData.GetEnumerator() | Sort-Object Key) {
     $serverIndex++
 
     Write-Progress -Activity 'Processing Servers' -Status $serverName -PercentComplete (($serverIndex / $serverData.Count) * 100)
-    Write-Host "Processing: $serverName" -ForegroundColor White
+    Write-Host ("--------------------------------------------------------------") -ForegroundColor DarkGray
+    Write-Host ("[{0}/{1}] Processing: {2}" -f $serverIndex, $serverData.Count, $serverName) -ForegroundColor Cyan
 
     $report = New-Object 'System.Collections.Generic.List[string]'
     $criticality = 'Unknown'
@@ -291,6 +500,7 @@ foreach ($serverEntry in $serverData.GetEnumerator() | Sort-Object Key) {
 
     $discoveryContent = $null
     if ($files.Discovery) {
+        Write-Host "  Discovery:  $($files.Discovery.Name)" -ForegroundColor DarkGray
         try {
             $discoveryContent = Get-Content -Path $files.Discovery.FullName -Raw
             $roleValue = Get-MatchValue -Text $discoveryContent -Pattern '\*\*Primary Role:\*\*\s*([^\r\n]+)'
@@ -348,13 +558,19 @@ foreach ($serverEntry in $serverData.GetEnumerator() | Sort-Object Key) {
                     ForEach-Object { $_.Trim() }
                 )
             }
+
+            Write-Host ("    Role: {0}  Criticality: {1}  Score: {2}  Workloads: {3}  Users: {4}" -f $role, $criticality, $criticalScore, $workloadCount, $userCount) -ForegroundColor DarkGray
         } catch {
             Write-Warning "Could not parse discovery for ${serverName}: $($_.Exception.Message)"
         }
+    } else {
+        Write-Host '  Discovery:  (not found)' -ForegroundColor Yellow
     }
 
     $readinessContent = $null
+    $readinessRows = @()
     if ($files.Readiness) {
+        Write-Host "  Readiness:  $($files.Readiness.Name)" -ForegroundColor DarkGray
         try {
             $readinessContent = Get-Content -Path $files.Readiness.FullName -Raw
             $decisionValue = Get-MatchValue -Text $readinessContent -Pattern '-\s+Decision:\s*\*\*(.*?)\*\*'
@@ -371,12 +587,28 @@ foreach ($serverEntry in $serverData.GetEnumerator() | Sort-Object Key) {
                 $goStatus = 'CONDITIONAL'
             }
 
-            $confirmedUseFindings = @(Get-ReadinessFindings -Content $readinessContent -Heading '2025 Changes With Confirmed Use')
-            $configuredFindings = @(Get-ReadinessFindings -Content $readinessContent -Heading '2025 Changes Configured But Usage Not Proven')
-            $telemetryGaps = @(Get-ReadinessGapLines -Content $readinessContent)
+            if ($files.ReadinessJson) {
+                $readinessRows = @(Get-ReadinessRowsFromJson -File $files.ReadinessJson)
+            }
+
+            if ($readinessRows.Count -gt 0) {
+                $confirmedUseFindings = @(Convert-ReadinessRowsToFindings -Rows $readinessRows -UsageState 'ConfirmedUse')
+                $configuredFindings = @(Convert-ReadinessRowsToFindings -Rows $readinessRows -UsageState 'ConfigOnly')
+                $telemetryGaps = @(Convert-ReadinessRowsToGapLines -Rows $readinessRows)
+            } else {
+                $confirmedUseFindings = @(Get-ReadinessFindings -Content $readinessContent -Heading '2025 Changes With Confirmed Use')
+                $configuredFindings = @(Get-ReadinessFindings -Content $readinessContent -Heading '2025 Changes Configured But Usage Not Proven')
+                $telemetryGaps = @(Get-ReadinessGapLines -Content $readinessContent)
+            }
+
+            $observedLogFindings = @(Get-LogEvidenceFindings -Findings ($confirmedUseFindings + $configuredFindings))
+
+            Write-Host ("    Decision: {0}  Blockers: {1}  Risks: {2}  Gaps: {3}" -f $decision, $confirmedUseFindings.Count, $configuredFindings.Count, $telemetryGaps.Count) -ForegroundColor DarkGray
         } catch {
             Write-Warning "Could not parse readiness for ${serverName}: $($_.Exception.Message)"
         }
+    } else {
+        Write-Host '  Readiness:  (not found)' -ForegroundColor Yellow
     }
 
     if ($files.Applications) {
@@ -475,6 +707,15 @@ foreach ($serverEntry in $serverData.GetEnumerator() | Sort-Object Key) {
                 $report.Add("  Required action: $($finding.Action)")
             }
             $report.Add('')
+
+            $report.Add('### Blockers To Clear')
+            $report.Add('')
+            foreach ($finding in $confirmedUseFindings) {
+                $report.Add("- **$($finding.Name)**")
+                $report.Add("  Blocker evidence: $($finding.Evidence)")
+                $report.Add("  Clear when: $($finding.Action)")
+            }
+            $report.Add('')
         }
 
         if ($configuredFindings.Count -gt 0) {
@@ -497,6 +738,15 @@ foreach ($serverEntry in $serverData.GetEnumerator() | Sort-Object Key) {
             }
             $report.Add('')
         }
+
+        if ($observedLogFindings.Count -gt 0) {
+            $report.Add('### Observed Log Findings')
+            $report.Add('')
+            foreach ($finding in $observedLogFindings) {
+                $report.Add("- **$($finding.Name)**: $($finding.Evidence)")
+            }
+            $report.Add('')
+        }
     }
 
     $report.Add('## Change Request Narrative')
@@ -508,39 +758,22 @@ foreach ($serverEntry in $serverData.GetEnumerator() | Sort-Object Key) {
 
     $report.Add('## Pre-Change Checklist')
     $report.Add('')
-    $report.Add('- [ ] Confirm latest backup/snapshot and rollback path are available and tested.')
-    $report.Add('- [ ] Confirm maintenance window, outage expectation, and stakeholder approval.')
-    $report.Add('- [ ] Confirm application owners for all listed workloads are aware and available if needed.')
-    $report.Add('- [ ] Review confirmed blockers and validation risks in this report.')
-    if ($priorityTests.Count -gt 0) {
-        foreach ($test in $priorityTests) {
-            $report.Add($test)
-        }
-    }
-    if ($generalTests.Count -gt 0) {
-        foreach ($test in $generalTests) {
-            $report.Add($test)
-        }
-    }
+    $report.Add('- [ ] Confirm latest backup/snapshot is available.')
+    $report.Add('- [ ] Schedule with the application owners for all listed workloads.')
+    $report.Add('- [ ] Review infrastructure team blockers in this report.')
+    $report.Add('- [ ] Confirm all blockers are resolved before the change starts.')
     $report.Add('')
 
     $report.Add('## Post-Change Validation')
     $report.Add('')
-    if ($postMaintenanceTests.Count -gt 0) {
-        foreach ($test in $postMaintenanceTests) {
-            $report.Add($test)
-        }
-    } else {
-        $report.Add('- [ ] Verify services, ports, authentication, monitoring, and workload-specific tests all pass.')
-        $report.Add('- [ ] Review System/Application/Security events for new errors after the change.')
-        $report.Add('- [ ] Confirm end-user or app-owner validation for all in-scope workloads.')
-    }
+    $report.Add('- [ ] Monitor to make sure everything works as expected after the change.')
+    $report.Add('- [ ] Test to make sure all in-scope workloads and services work correctly.')
+    $report.Add('- [ ] Verify no unexpected service failures.')
     $report.Add('')
 
     $report.Add('## Rollback Considerations')
     $report.Add('')
     $report.Add('- If critical workload validation fails, initiate rollback using the approved backup/snapshot procedure.')
-    $report.Add('- Preserve event logs, screenshots, installer output, and validation results for the change record.')
     $report.Add('- Reconfirm service health, application pools, file access, and remote management after rollback.')
     $report.Add('')
 
@@ -568,34 +801,41 @@ foreach ($serverEntry in $serverData.GetEnumerator() | Sort-Object Key) {
     $report.Add('')
     $report.Add('| Source | File |')
     $report.Add('|--------|------|')
-    $report.Add("| Discovery | $($files.Discovery.Name) |")
+    $report.Add("| Discovery | $(if ($files.Discovery) { $files.Discovery.Name } else { 'Not found' }) |")
     $report.Add("| Readiness | $(if ($files.Readiness) { $files.Readiness.Name } else { 'Not found' }) |")
+    $report.Add("| Readiness JSON | $(if ($files.ReadinessJson) { $files.ReadinessJson.Name } else { 'Not found' }) |")
     $report.Add("| Workloads CSV | $(if ($files.Workloads) { $files.Workloads.Name } else { 'Not found' }) |")
     $report.Add("| Test Plan CSV | $(if ($files.TestPlan) { $files.TestPlan.Name } else { 'Not found' }) |")
     $report.Add("| Applications CSV | $(if ($files.Applications) { $files.Applications.Name } else { 'Not found' }) |")
     $report.Add('')
 
     $serverReportPath = Join-Path $OutputDirectory "ChangeSupport_${serverName}_${timestamp}.md"
-    $report | Out-File -FilePath $serverReportPath -Encoding UTF8
-    Write-Host "  Saved: $([System.IO.Path]::GetFileName($serverReportPath))" -ForegroundColor Green
+    Write-Host "  Writing report..." -ForegroundColor DarkGray
+    try {
+        $report | Out-File -FilePath $serverReportPath -Encoding UTF8
+        Write-Host ("  [OK] Saved: {0}" -f $serverReportPath) -ForegroundColor Green
+    } catch {
+        Write-Host ("  [FAIL] Could not write report: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    }
 
     $allServerSummaries.Add([PSCustomObject]@{
-        ServerName = $serverName
+        ServerName  = $serverName
         Criticality = $criticality
-        Score = $criticalScore
-        Role = $role
-        Decision = $decision
-        GoStatus = $goStatus
-        Blockers = $blockerCount
-        Risks = $riskCount
-        Workloads = $workloadCount
-        Users = $userCount
-        ReportFile = $serverReportPath
+        Score       = $criticalScore
+        Role        = $role
+        Decision    = $decision
+        GoStatus    = $goStatus
+        Blockers    = $blockerCount
+        Risks       = $riskCount
+        Workloads   = $workloadCount
+        Users       = $userCount
+        ReportFile  = $serverReportPath
     })
 }
 
 Write-Progress -Activity 'Processing Servers' -Completed
-Write-Host "`nGenerating master summary report..." -ForegroundColor White
+Write-Host "`n--------------------------------------------------------------" -ForegroundColor DarkGray
+Write-Host "Generating master summary report..." -ForegroundColor White
 
 $masterReport = New-Object 'System.Collections.Generic.List[string]'
 $masterReport.Add('# Master Change Summary - Server Upgrade Readiness')
@@ -617,9 +857,25 @@ foreach ($srv in $allServerSummaries | Sort-Object Score -Descending) {
 $masterReport.Add('')
 
 $masterPath = Join-Path $OutputDirectory "MASTER-ChangeSummary_${timestamp}.md"
-$masterReport | Out-File -FilePath $masterPath -Encoding UTF8
+try {
+    $masterReport | Out-File -FilePath $masterPath -Encoding UTF8
+    Write-Host ("[OK] Master summary: {0}" -f $masterPath) -ForegroundColor Green
+} catch {
+    Write-Host ("[FAIL] Could not write master summary: {0}" -f $_.Exception.Message) -ForegroundColor Red
+}
 
-Write-Host "`nMaster report saved: $([System.IO.Path]::GetFileName($masterPath))" -ForegroundColor Green
-Write-Host 'Summary:' -ForegroundColor Cyan
-Write-Host "   Per-server reports: $($allServerSummaries.Count)" -ForegroundColor White
-Write-Host "All reports saved to: $OutputDirectory" -ForegroundColor Cyan
+Write-Host "`n==============================================================" -ForegroundColor Cyan
+Write-Host 'DONE' -ForegroundColor Cyan
+Write-Host '==============================================================' -ForegroundColor Cyan
+Write-Host ("  Per-server reports : {0}" -f $allServerSummaries.Count) -ForegroundColor White
+Write-Host ("  Output directory   : {0}" -f $OutputDirectory) -ForegroundColor White
+
+$goCount   = @($allServerSummaries | Where-Object GoStatus -eq 'GO').Count
+$condCount = @($allServerSummaries | Where-Object GoStatus -eq 'CONDITIONAL').Count
+$noGoCount = @($allServerSummaries | Where-Object GoStatus -eq 'NO-GO').Count
+$unkCount  = @($allServerSummaries | Where-Object GoStatus -eq 'UNKNOWN').Count
+
+Write-Host ("  GO                 : {0}" -f $goCount) -ForegroundColor Green
+if ($condCount -gt 0) { Write-Host ("  CONDITIONAL        : {0}" -f $condCount) -ForegroundColor Yellow }
+if ($noGoCount -gt 0) { Write-Host ("  NO-GO              : {0}" -f $noGoCount) -ForegroundColor Red }
+if ($unkCount -gt 0) { Write-Host ("  Unknown/no data    : {0}" -f $unkCount) -ForegroundColor DarkGray }

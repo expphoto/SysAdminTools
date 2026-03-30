@@ -48,7 +48,7 @@ param(
 )
 
 Set-StrictMode -Version 2.0
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'
 
 # Resolve OutputDirectory - use current directory if not specified
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
@@ -219,6 +219,7 @@ function Invoke-ServiceAnalysis {
         'Hyper-V' = @('vmms', 'vmcompute')
         'PrintServer' = @('Spooler')
         'RemoteDesktop' = @('TermService', 'SessionEnv')
+        'SAP' = @('SAPOSCOL', 'SAPHostControl', 'sapstartsrv')
     }
 
     $detectedRoles = New-Object 'System.Collections.Generic.List[string]'
@@ -229,6 +230,13 @@ function Invoke-ServiceAnalysis {
                 if ($detectedRoles -notcontains $role) {
                     $detectedRoles.Add($role)
                 }
+            }
+        }
+
+        # Check for SAP instance services (pattern: SAP<SID>_XX where XX is instance number)
+        if ($service.Name -match '^SAP[A-Z0-9]{3}_\d{2}$') {
+            if ($detectedRoles -notcontains 'SAP') {
+                $detectedRoles.Add('SAP')
             }
         }
 
@@ -298,21 +306,8 @@ function Invoke-NetworkAnalysis {
             $script:NetworkActivity.ActiveConnections = @($tcpConns | Where-Object { $_.State -eq 'Established' }).Count
             $script:NetworkActivity.UniqueRemoteHosts = @($remoteAddresses).Count
 
-    # Listening ports
-    $listeningPorts = New-Object 'System.Collections.Generic.List[object]'
-    $portConnectionCounts = @{}
-
-    # Try Get-NetTCPConnection first (Server 2012 R2+)
-    if (Get-Command -Name Get-NetTCPConnection -ErrorAction SilentlyContinue) {
-        try {
-            $tcpConns = Get-NetTCPConnection -State Established, Listen -ErrorAction Stop
-
-            # Count unique remote addresses (inbound connections indicator)
-            $remoteAddresses = $tcpConns |
-                Where-Object { $_.State -eq 'Established' -and $_.RemoteAddress -ne '127.0.0.1' -and $_.RemoteAddress -ne '::1' } |
-                Select-Object -ExpandProperty RemoteAddress -Unique
-
-            # Count connections per port
+            # Listening ports with connection counts
+            $portConnectionCounts = @{}
             foreach ($conn in $tcpConns) {
                 if ($conn.State -eq 'Established') {
                     $localPort = $conn.LocalPort
@@ -323,10 +318,6 @@ function Invoke-NetworkAnalysis {
                 }
             }
 
-            $script:NetworkActivity.ActiveConnections = @($tcpConns | Where-Object { $_.State -eq 'Established' }).Count
-            $script:NetworkActivity.UniqueRemoteHosts = @($remoteAddresses).Count
-
-            # Listening ports
             $listening = $tcpConns | Where-Object { $_.State -eq 'Listen' }
             foreach ($listener in $listening) {
                 $process = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
@@ -339,10 +330,6 @@ function Invoke-NetworkAnalysis {
                     ActiveConnections = if ($portConnectionCounts.ContainsKey($port)) { $portConnectionCounts[$port] } else { 0 }
                 })
             }
-        } catch {
-            Write-Verbose "Get-NetTCPConnection failed: $($_.Exception.Message)"
-        }
-    }
         } catch {
             Write-Verbose "Get-NetTCPConnection failed: $($_.Exception.Message)"
         }
@@ -661,9 +648,10 @@ function Invoke-WorkloadDetection {
         }
 
         # Check app pools that are started
-        $runningAppPools = $appPools | Where-Object { $_.Value -eq 'Started' }
+        $runningAppPools = @($appPools | Where-Object { $_.Value -eq 'Started' })
 
         # Map log traffic to applications
+        $appRequestCounts = @{}
         $appsWithTraffic = New-Object 'System.Collections.Generic.List[string]'
         $topAppsByTraffic = @()
         if ($appRequestCounts.Count -gt 0) {
@@ -778,11 +766,13 @@ ORDER BY ActiveConnections DESC, SizeMB DESC
         } catch {
             Write-Verbose "Could not query SQL databases: $($_.Exception.Message)"
             # Fallback to basic count
+            $confidence = 'Low'  # Initialize confidence since we can't determine activity
             try {
                 $sqlCmd = "SELECT COUNT(*) AS DbCount FROM sys.databases WHERE database_id > 4"
                 $result = Invoke-Sqlcmd -Query $sqlCmd -ServerInstance $script:Hostname -ErrorAction Stop
                 $dbCount = $result.DbCount
                 $sqlEvidence = "$dbCount user database(s) present (activity unknown)"
+                $confidence = 'Medium'  # Upgrade confidence if we at least got database count
                 if ($dbCount -gt 5) {
                     $sqlCriticality = 'HIGH'
                     $script:CriticalityScore += 25
@@ -792,6 +782,7 @@ ORDER BY ActiveConnections DESC, SizeMB DESC
             } catch {
                 Write-Verbose "Could not query basic SQL database count"
                 $script:CriticalityScore += 10
+                $sqlEvidence = 'SQL Server service detected (database details unavailable)'
             }
         }
 
@@ -802,6 +793,248 @@ ORDER BY ActiveConnections DESC, SizeMB DESC
             Criticality = $sqlCriticality
             TestScenario = 'Test database connectivity, run sample queries, verify backups'
             Details = $sqlDetails
+        })
+    }
+
+    # SAP System Detection (NetWeaver, HANA, S/4HANA)
+    if ($script:ServerProfile.DetectedRoles -contains 'SAP') {
+        $sapCriticality = 'HIGH'  # SAP systems are typically mission-critical
+        $sapConfidence = 'High'
+        $sapInstances = @()
+        $sapProcesses = @()
+        $sapPorts = @()
+
+        $sapDetails = @{
+            Instances = @()
+            InstallPath = $null
+            SystemType = @()
+            HANADetected = $false
+            NetWeaverDetected = $false
+            ActiveProcesses = @()
+            ListeningPorts = @()
+            TotalInstances = 0
+        }
+
+        # Detect SAP instances from services (pattern: SAP<SID>_<InstanceNumber>)
+        $services = @(Get-Service | Where-Object { $_.Status -eq 'Running' })
+        $sapServicePattern = '^SAP([A-Z0-9]{3})_(\d{2})$'
+
+        foreach ($service in $services) {
+            if ($service.Name -match $sapServicePattern) {
+                $sid = $Matches[1]
+                $instanceNum = $Matches[2]
+
+                $sapInstances += [PSCustomObject]@{
+                    SID = $sid
+                    InstanceNumber = $instanceNum
+                    ServiceName = $service.Name
+                    DisplayName = $service.DisplayName
+                    Status = $service.Status
+                    Type = 'Unknown'  # Will be determined by process analysis
+                }
+            }
+
+            # Check for HANA-specific services
+            if ($service.Name -like 'HDB*' -or $service.Name -like '*HANA*') {
+                $sapDetails.HANADetected = $true
+                if ($sapDetails.SystemType -notcontains 'SAP HANA Database') {
+                    $sapDetails.SystemType += 'SAP HANA Database'
+                }
+            }
+        }
+
+        # Check for SAP installation directory
+        $sapPaths = @('C:\usr\sap', 'D:\usr\sap', 'E:\usr\sap')
+        foreach ($path in $sapPaths) {
+            if (Test-Path $path -ErrorAction SilentlyContinue) {
+                $sapDetails.InstallPath = $path
+                break
+            }
+        }
+
+        # Detect SAP processes (read-only analysis)
+        $sapProcessNames = @(
+            'disp+work',      # ABAP Dispatcher + Work Process
+            'msg_server',     # Message Server
+            'enserver',       # Enqueue Server
+            'gwrd',           # Gateway
+            'igswd',          # Internet Graphics Server
+            'jstart',         # Java Instance
+            'jcontrol',       # Java Control Process
+            'hdbdaemon',      # HANA Daemon
+            'hdbcompileserver', # HANA Compile Server
+            'hdbindexserver', # HANA Index Server
+            'hdbwebdispatcher', # HANA Web Dispatcher
+            'sapstartsrv'     # SAP Start Service
+        )
+
+        $runningProcesses = Get-Process | Where-Object {
+            $processName = $_.ProcessName
+            $sapProcessNames | Where-Object { $processName -like "*$_*" }
+        }
+
+        foreach ($proc in $runningProcesses) {
+            $sapProcesses += $proc.ProcessName
+            $sapDetails.ActiveProcesses += [PSCustomObject]@{
+                Name = $proc.ProcessName
+                PID = $proc.Id
+                MemoryMB = [math]::Round($proc.WorkingSet64 / 1MB, 2)
+                StartTime = if ($proc.StartTime) { $proc.StartTime } else { $null }
+            }
+
+            # Determine SAP component type from process
+            if ($proc.ProcessName -like '*disp+work*') {
+                if ($sapDetails.SystemType -notcontains 'SAP NetWeaver ABAP') {
+                    $sapDetails.SystemType += 'SAP NetWeaver ABAP'
+                    $sapDetails.NetWeaverDetected = $true
+                }
+            }
+            if ($proc.ProcessName -like '*jstart*' -or $proc.ProcessName -like '*jcontrol*') {
+                if ($sapDetails.SystemType -notcontains 'SAP NetWeaver Java') {
+                    $sapDetails.SystemType += 'SAP NetWeaver Java'
+                    $sapDetails.NetWeaverDetected = $true
+                }
+            }
+            if ($proc.ProcessName -like '*hdb*') {
+                if ($sapDetails.SystemType -notcontains 'SAP HANA Database') {
+                    $sapDetails.SystemType += 'SAP HANA Database'
+                    $sapDetails.HANADetected = $true
+                }
+            }
+        }
+
+        # Enrich instance information with process data
+        foreach ($instance in $sapInstances) {
+            # Try to determine instance type from running processes
+            try {
+                $instNum = [int]$instance.InstanceNumber
+            } catch {
+                Write-Verbose "Could not convert instance number to integer: $($instance.InstanceNumber)"
+                continue
+            }
+
+            # Check for HANA ports (3<instance>13, 3<instance>15, 5<instance>13-15)
+            $hanaHttpPort = 80 + $instNum
+            $hanaHttpsPort = 443 + $instNum
+            $hanaSqlPort = 30000 + ($instNum * 100) + 13
+            $hanaIndexServerPort = 30000 + ($instNum * 100) + 15
+
+            # Check for NetWeaver ports (32<instance>, 33<instance>, 36<instance>, 80<instance>)
+            $sapDispatcherPort = 3200 + $instNum
+            $sapGatewayPort = 3300 + $instNum
+            $sapMessagePort = 3600 + $instNum
+            $sapHttpPort = 8000 + $instNum
+
+            $listeningPorts = @()
+
+            # Note: We're checking if these ports are in use (read-only)
+            # This doesn't modify anything, just discovers listening ports
+            try {
+                $connections = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.LocalPort -in @(
+                            $hanaHttpPort, $hanaHttpsPort, $hanaSqlPort, $hanaIndexServerPort,
+                            $sapDispatcherPort, $sapGatewayPort, $sapMessagePort, $sapHttpPort
+                        )
+                    }
+
+                foreach ($conn in $connections) {
+                    $listeningPorts += $conn.LocalPort
+
+                    # Determine instance type from listening ports
+                    if ($conn.LocalPort -eq $hanaSqlPort -or $conn.LocalPort -eq $hanaIndexServerPort) {
+                        $instance.Type = 'HANA Database'
+                    }
+                    elseif ($conn.LocalPort -eq $sapDispatcherPort -or $conn.LocalPort -eq $sapGatewayPort) {
+                        if ($instance.Type -eq 'Unknown') {
+                            $instance.Type = 'NetWeaver Application Server'
+                        }
+                    }
+                }
+
+                # Add each port individually to avoid array concatenation issues
+                foreach ($port in $listeningPorts) {
+                    $sapPorts += $port
+                    $sapDetails.ListeningPorts += $port
+                }
+            }
+            catch {
+                Write-Verbose "Could not query network connections for SAP ports"
+            }
+        }
+
+        $sapDetails.Instances = $sapInstances
+        $sapDetails.TotalInstances = @($sapInstances).Count
+
+        # Build evidence string
+        $instanceCount = @($sapInstances).Count
+        $instanceSummary = if ($instanceCount -gt 0) {
+            $instanceNames = @($sapInstances | ForEach-Object {
+                if ($_.SID -and $_.InstanceNumber) {
+                    "$($_.SID)/$($_.InstanceNumber)"
+                }
+            })
+            if ($instanceNames.Count -gt 0) {
+                $instanceNames -join ', '
+            } else {
+                'detected via services/processes'
+            }
+        } else {
+            'detected via services/processes'
+        }
+
+        $systemTypeArray = @($sapDetails.SystemType)
+        $systemTypeCount = $systemTypeArray.Count
+        $systemTypes = if ($systemTypeCount -gt 0) {
+            $systemTypeArray -join ', '
+        } else {
+            'SAP System'
+        }
+
+        $processCount = @($sapDetails.ActiveProcesses).Count
+        $allPorts = @($sapDetails.ListeningPorts)
+        $uniquePorts = $allPorts | Select-Object -Unique
+        $portCount = @($uniquePorts).Count
+
+        $sapEvidence = "$systemTypes - Instances: $instanceSummary, $processCount active SAP processes, $portCount listening ports"
+
+        # Confidence level based on detection quality
+        if ($instanceCount -gt 0 -and $processCount -gt 5) {
+            $sapConfidence = 'High'
+            $sapCriticality = 'HIGH'
+            $script:CriticalityScore += 40  # SAP systems are mission-critical
+        }
+        elseif ($instanceCount -gt 0 -or $processCount -gt 2) {
+            $sapConfidence = 'High'
+            $sapCriticality = 'HIGH'
+            $script:CriticalityScore += 35
+        }
+        else {
+            $sapConfidence = 'Medium'
+            $sapCriticality = 'HIGH'
+            $script:CriticalityScore += 30
+        }
+
+        # Generate test scenario based on detected SAP components
+        $testScenarios = @()
+        if ($sapDetails.HANADetected) {
+            $testScenarios += 'Test HANA database connectivity (SQL/ODBC/JDBC)'
+        }
+        if ($sapDetails.NetWeaverDetected) {
+            $testScenarios += 'Test SAP GUI connectivity, transaction access'
+        }
+        $testScenarios += 'Verify SAP system status, check work processes, validate RFC connectivity'
+        $testScenarios += 'Test user authentication (SAP and OS level), verify backup systems'
+
+        $testScenario = $testScenarios -join '; '
+
+        $script:ActiveWorkloads.Add([PSCustomObject]@{
+            Type = 'SAP System'
+            Confidence = $sapConfidence
+            Evidence = $sapEvidence
+            Criticality = $sapCriticality
+            TestScenario = $testScenario
+            Details = $sapDetails
         })
     }
 
@@ -967,7 +1200,7 @@ function Invoke-ApplicationInventory {
     }
 
     # Match running processes to installed apps with better detail
-    $runningProcesses = @(Get-Process | Select-Object Name, Id, WorkingSet64, TotalProcessorTime, StartTime -Unique)
+    $runningProcesses = @(Get-Process | Select-Object Name, Id, WorkingSet64, TotalProcessorTime, StartTime)
     $processByName = @{}
     foreach ($proc in $runningProcesses) {
         if (-not $processByName.ContainsKey($proc.Name)) {
@@ -1141,12 +1374,22 @@ function Export-MarkdownReport {
     $md.Add("- **Unique Remote Hosts:** $($script:NetworkActivity.UniqueRemoteHosts)")
     $md.Add("")
 
-    if ($script:NetworkActivity.ListeningPorts -and $script:NetworkActivity.ListeningPorts.Count -gt 0) {
+    $portCount = 0
+    if ($script:NetworkActivity.ListeningPorts) {
+        try {
+            $portCount = @($script:NetworkActivity.ListeningPorts).Count
+        } catch {
+            $portCount = 0
+        }
+    }
+    if ($portCount -gt 0) {
         $md.Add("### Listening Ports")
         $md.Add("")
         $md.Add("| Port | Process | PID | Local Address | Active Connections |")
         $md.Add("|------|---------|-----|---------------|-------------------|")
-        $sortedPorts = $script:NetworkActivity.ListeningPorts | Sort-Object { [int]$_.Port }
+        $sortedPorts = $script:NetworkActivity.ListeningPorts | Sort-Object -Property @{
+            Expression = { try { [int]([string]$_.Port) } catch { 0 } }
+        }, Process
         foreach ($port in $sortedPorts | Select-Object -First 20) {
             $localAddr = if ($port.LocalAddress) { $port.LocalAddress } else { '*' }
             $activeConns = if ($port.ActiveConnections -gt 0) { $port.ActiveConnections } else { '-' }
@@ -1185,9 +1428,9 @@ function Export-MarkdownReport {
                 }
             }
             if ($workload.Type -eq 'SQL Server Database Engine' -and $workload.Details) {
-                $activeDbs = $workload.Details.Databases | Where-Object { $_.ActiveConnections -gt 0 }
-                $inactiveDbs = $workload.Details.Databases | Where-Object { $_.ActiveConnections -eq 0 }
-                
+                $activeDbs = @($workload.Details.Databases | Where-Object { $_.ActiveConnections -gt 0 })
+                $inactiveDbs = @($workload.Details.Databases | Where-Object { $_.ActiveConnections -eq 0 })
+
                 $md.Add("  - **Active Databases to Test:**")
                 foreach ($db in $activeDbs | Select-Object -First 5) {
                     $md.Add("    - $($db.DatabaseName) ($($db.ActiveConnections) connections)")
@@ -1214,13 +1457,14 @@ function Export-MarkdownReport {
                 }
                 
                 # Show applications with actual HTTP traffic
-                if ($details.ApplicationsWithTraffic.Count -gt 0) {
+                $appsWithTrafficCount = @($details.ApplicationsWithTraffic).Count
+                if ($appsWithTrafficCount -gt 0) {
                     $md.Add("  - **Applications with HTTP Traffic (from log analysis):**")
                     foreach ($appTraffic in $details.ApplicationsWithTraffic | Select-Object -First 10) {
                         $md.Add("    - $appTraffic")
                     }
-                    if ($details.ApplicationsWithTraffic.Count -gt 10) {
-                        $remaining = $details.ApplicationsWithTraffic.Count - 10
+                    if ($appsWithTrafficCount -gt 10) {
+                        $remaining = $appsWithTrafficCount - 10
                         $md.Add("    - *... and $remaining more applications with traffic*")
                     }
                 } else {
@@ -1298,7 +1542,8 @@ function Export-MarkdownReport {
 
     # SQL Server Details (if applicable)
     $sqlWorkload = $script:ActiveWorkloads | Where-Object { $_.Type -eq 'SQL Server Database Engine' }
-    if ($sqlWorkload -and $sqlWorkload.Details -and $sqlWorkload.Details.Databases.Count -gt 0) {
+    if ($sqlWorkload -and $sqlWorkload.Details -and @($sqlWorkload.Details.Databases).Count -gt 0) {
+        $sqlDbCount = @($sqlWorkload.Details.Databases).Count
         $md.Add("## SQL Server Database Details")
         $md.Add("")
         $md.Add("| Database | Status | Size (MB) | Active Connections | Last Activity |")
@@ -1307,13 +1552,13 @@ function Export-MarkdownReport {
             $lastActivity = if ($db.LastActivity) { $db.LastActivity.ToString('yyyy-MM-dd HH:mm') } else { 'Never/Unknown' }
             $md.Add("| $($db.DatabaseName) | $($db.State) | $($db.SizeMB) | $($db.ActiveConnections) | $lastActivity |")
         }
-        if ($sqlWorkload.Details.Databases.Count -gt 15) {
-            $md.Add("| *... and $($sqlWorkload.Details.Databases.Count - 15) more databases* | | | | |")
+        if ($sqlDbCount -gt 15) {
+            $md.Add("| *... and $($sqlDbCount - 15) more databases* | | | | |")
         }
         $md.Add("")
-        
-        if ($sqlWorkload.Details.ActiveDatabases -lt $sqlWorkload.Details.Databases.Count) {
-            $inactiveCount = $sqlWorkload.Details.Databases.Count - $sqlWorkload.Details.ActiveDatabases
+
+        if ($sqlWorkload.Details.ActiveDatabases -lt $sqlDbCount) {
+            $inactiveCount = $sqlDbCount - $sqlWorkload.Details.ActiveDatabases
             $md.Add("**Note:** $inactiveCount database(s) show no recent activity. Consider reviewing for decommissioning.")
             $md.Add("")
         }
@@ -1359,7 +1604,7 @@ function Export-MarkdownReport {
         $md.Add("- **Recent Print Jobs:** $($details.RecentPrintJobs)")
         $md.Add("- **Activity Level:** $($details.ActivityLevel)")
         $md.Add("")
-        if ($details.ActivePrinterList.Count -gt 0) {
+        if (@($details.ActivePrinterList).Count -gt 0) {
             $md.Add("**Active Printers:** $(($details.ActivePrinterList | Select-Object -First 10) -join ', ')")
             $md.Add("")
         }
@@ -1550,7 +1795,8 @@ function Export-CsvReports {
         if ($workload.Details) {
             switch ($workload.Type) {
                 'SQL Server Database Engine' {
-                    $detailSummary = "$($workload.Details.ActiveDatabases)/$($workload.Details.Databases.Count) active DBs, $($workload.Details.TotalConnections) connections"
+                    $dbCount = @($workload.Details.Databases).Count
+                    $detailSummary = "$($workload.Details.ActiveDatabases)/$dbCount active DBs, $($workload.Details.TotalConnections) connections"
                 }
                 'File Server' {
                     $detailSummary = "$($workload.Details.UserShares) user shares, $($workload.Details.ActiveShares) active, $($workload.Details.OpenFiles) open files, $($workload.Details.ActiveSessions) sessions"
@@ -1562,7 +1808,8 @@ function Export-CsvReports {
                     $detailSummary = "$($workload.Details.ActivePrinters) active, $($workload.Details.RecentPrintJobs) recent jobs"
                 }
                 'Web Server (IIS)' {
-                    $detailSummary = "$($workload.Details.ActiveSites.Count)/$($workload.Details.TotalSites) sites started, $($workload.Details.TotalAppPools) app pools, $($workload.Details.RecentLogEntries) log entries"
+                    $activeSitesCount = @($workload.Details.ActiveSites).Count
+                    $detailSummary = "$activeSitesCount/$($workload.Details.TotalSites) sites started, $($workload.Details.TotalAppPools) app pools, $($workload.Details.RecentLogEntries) log entries"
                 }
             }
         }
@@ -1627,7 +1874,15 @@ try {
     Write-Host "Active Workloads: $($script:ActiveWorkloads.Count)" -ForegroundColor White
     
     # Show listening ports summary
-    if ($script:NetworkActivity.ListeningPorts -and $script:NetworkActivity.ListeningPorts.Count -gt 0) {
+    $portCount2 = 0
+    if ($script:NetworkActivity.ListeningPorts) {
+        try {
+            $portCount2 = @($script:NetworkActivity.ListeningPorts).Count
+        } catch {
+            $portCount2 = 0
+        }
+    }
+    if ($portCount2 -gt 0) {
         $highTraffic = $script:NetworkActivity.ListeningPorts | Where-Object { $_.ActiveConnections -gt 0 } | Sort-Object ActiveConnections -Descending | Select-Object -First 5
         if ($highTraffic) {
             Write-Host "High-Traffic Ports:" -ForegroundColor White
@@ -1671,12 +1926,13 @@ try {
     $sqlWorkload = $script:ActiveWorkloads | Where-Object { $_.Type -eq 'SQL Server Database Engine' }
     if ($sqlWorkload -and $sqlWorkload.Details) {
         $details = $sqlWorkload.Details
-        Write-Host "SQL Server: $($details.Databases.Count) databases, $($details.ActiveDatabases) active, $($details.TotalConnections) current connections" -ForegroundColor White
+        $dbCount = @($details.Databases).Count
+        Write-Host "SQL Server: $dbCount databases, $($details.ActiveDatabases) active, $($details.TotalConnections) current connections" -ForegroundColor White
         if ($details.TotalConnections -eq 0) {
             Write-Host "  WARNING: No active SQL connections detected" -ForegroundColor Yellow
         }
-        if ($details.Databases.Count -gt 0 -and $details.ActiveDatabases -lt $details.Databases.Count) {
-            $inactive = $details.Databases.Count - $details.ActiveDatabases
+        if ($dbCount -gt 0 -and $details.ActiveDatabases -lt $dbCount) {
+            $inactive = $dbCount - $details.ActiveDatabases
             Write-Host "  Note: $inactive database(s) show no recent activity" -ForegroundColor Gray
         }
     }
@@ -1702,15 +1958,16 @@ try {
         if ($details.RecentLogEntries -eq 0) {
             Write-Host "  WARNING: No recent IIS log activity detected" -ForegroundColor Yellow
         }
-        
+
         # Show top applications with traffic
-        if ($details.ApplicationsWithTraffic.Count -gt 0) {
+        $appsWithTrafficCount = @($details.ApplicationsWithTraffic).Count
+        if ($appsWithTrafficCount -gt 0) {
             Write-Host "  Apps with Traffic:" -ForegroundColor Gray
             $details.ApplicationsWithTraffic | Select-Object -First 5 | ForEach-Object {
                 Write-Host "    $_" -ForegroundColor Gray
             }
-            if ($details.ApplicationsWithTraffic.Count -gt 5) {
-                Write-Host "    ... and $(@($details.ApplicationsWithTraffic).Count - 5) more" -ForegroundColor Gray
+            if ($appsWithTrafficCount -gt 5) {
+                Write-Host "    ... and $($appsWithTrafficCount - 5) more" -ForegroundColor Gray
             }
         }
         
@@ -1739,7 +1996,14 @@ try {
     Write-Host ""
 
 } catch {
-    Write-Error "Discovery failed: $($_.Exception.Message)"
-    Write-Error $_.ScriptStackTrace
+    $err = $_
+    if ($err -is [System.Management.Automation.ErrorRecord]) {
+        Write-Error "Discovery failed: $($err.Exception.Message)"
+        if ($err.ScriptStackTrace) {
+            Write-Error $err.ScriptStackTrace
+        }
+    } else {
+        Write-Error "Discovery failed: $err"
+    }
     exit 1
 }

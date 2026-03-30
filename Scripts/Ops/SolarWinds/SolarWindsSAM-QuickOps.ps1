@@ -289,11 +289,12 @@ function Get-SWConnection {
     param(
         [string]$Server,
         [string]$User,
-        [securestring]$SecurePassword
+        [securestring]$SecurePassword,
+        [switch]$UseTrusted
     )
 
     try {
-        if ($User -and $SecurePassword) {
+        if (-not $UseTrusted -and $User -and $SecurePassword) {
             Write-SWLog "Connecting to SolarWinds: $Server" -Level INFO
             $credential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $User, $SecurePassword
             $swis = Connect-Swis -Hostname $Server -Credential $credential -ErrorAction Stop
@@ -321,6 +322,165 @@ function Test-SWSwisQuery {
     } catch {
         return @{ Success = $false; Error = $_ }
     }
+}
+
+function Test-SWMessageSecurityError {
+    param([object]$QueryTest)
+
+    if (-not $QueryTest -or $QueryTest.Success) {
+        return $false
+    }
+
+    $messages = @(
+        $QueryTest.Error.Exception.Message,
+        $QueryTest.Error.Exception.InnerException.Message,
+        $QueryTest.Error.ToString()
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    foreach ($message in $messages) {
+        if ($message -like "*verifying security for the message*" -or
+            $message -like "*trust relationship*" -or
+            $message -like "*certificate*" -or
+            $message -like "*SSL/TLS secure channel*"
+        ) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Update-SWConnectionHealth {
+    param([object]$Swis)
+
+    if (-not $Swis) {
+        $script:SWSafeMode = $true
+        return @{ Success = $false; SafeMode = $true; Error = 'No SWIS connection available.'; MessageSecurity = $false }
+    }
+
+    $queryTest = Test-SWSwisQuery -Swis $Swis
+    $isMessageSecurityError = Test-SWMessageSecurityError -QueryTest $queryTest
+
+    $script:SWSafeMode = -not $queryTest.Success
+
+    return @{
+        Success = $queryTest.Success
+        SafeMode = $script:SWSafeMode
+        Error = $queryTest.Error
+        MessageSecurity = $isMessageSecurityError
+    }
+}
+
+function Clear-SWStoredCredentials {
+    $script:SWStoredUserName = $null
+    $script:SWStoredPassword = $null
+}
+
+function Invoke-SWConnectionMenu {
+    param(
+        [ref]$SwisServer,
+        [ref]$UserName,
+        [ref]$Password
+    )
+
+    :connectionMenu do {
+        Clear-Host
+        Write-SWLog "=== CONNECTION & RECOVERY ===" -Level HEADER
+        Write-SWLog "" 
+        Write-SWLog "Server: $($SwisServer.Value)" -Level INFO
+        Write-SWLog ("Auth: {0}" -f $(if ($script:SWUseTrustedAuth) { 'Trusted/Windows' } elseif ($UserName.Value) { 'Credential' } else { 'Not configured' })) -Level INFO
+        Write-SWLog ("Status: {0}" -f $(if ($script:SWSafeMode) { 'SAFE MODE' } else { 'Healthy' })) -Level $(if ($script:SWSafeMode) { 'WARNING' } else { 'SUCCESS' })
+        if ($script:SWSafeMode) {
+            Write-SWLog "Azure/Entra interactive auth is not supported by SwisPowerShell. Use Trusted auth or a SolarWinds/AD credential that SWIS accepts." -Level WARNING
+        }
+        Write-SWLog ""
+        Write-SWLog "  1. Retry current connection" -Level INFO
+        Write-SWLog "  2. Switch auth mode (Credential/Trusted)" -Level INFO
+        Write-SWLog "  3. Re-enter credentials" -Level INFO
+        Write-SWLog "  4. Change hostname" -Level INFO
+        Write-SWLog "  5. Fetch/install server certificate" -Level INFO
+        Write-SWLog "  6. Certificate troubleshoot details" -Level INFO
+        Write-SWLog "  0. Back to main menu" -Level INFO
+        Write-SWLog ""
+
+        $selection = Read-Host "Enter selection"
+
+        switch ($selection) {
+            '1' {
+                return @{ Action = 'Reconnect' }
+            }
+            '2' {
+                Write-SWLog "Select auth mode:" -Level PROMPT
+                Write-SWLog "  1. Credential" -Level INFO
+                Write-SWLog "  2. Trusted/Windows" -Level INFO
+                $authSelection = Read-Host "Enter selection"
+                switch ($authSelection) {
+                    '1' {
+                        Clear-SWStoredCredentials
+                        $script:SWUseTrustedAuth = $false
+                        return @{ Action = 'Reconnect'; PromptForCredentials = $true }
+                    }
+                    '2' {
+                        Clear-SWStoredCredentials
+                        $script:SWUseTrustedAuth = $true
+                        return @{ Action = 'Reconnect' }
+                    }
+                    default {
+                        Write-SWLog "Invalid selection" -Level WARNING
+                        Start-Sleep -Seconds 1
+                    }
+                }
+            }
+            '3' {
+                $script:SWUseTrustedAuth = $false
+                Clear-SWStoredCredentials
+                return @{ Action = 'Reconnect'; PromptForCredentials = $true }
+            }
+            '4' {
+                $newHost = Read-Host "Enter new hostname (leave blank to keep $($SwisServer.Value))"
+                if (-not [string]::IsNullOrWhiteSpace($newHost)) {
+                    $SwisServer.Value = $newHost.Trim()
+                    return @{ Action = 'Reconnect' }
+                }
+            }
+            '5' {
+                if (-not $SwisServer.Value) {
+                    Write-SWLog "Set a hostname first." -Level WARNING
+                } else {
+                    $cert = Get-SWServerCertificate -HostName $SwisServer.Value -Port $SwisCertPort
+                    if ($cert) {
+                        Install-SWCertChain -Cert $cert | Out-Null
+                        $names = Get-SWCertNames -Cert $cert
+                        $res = Resolve-SWHostname -InputHost $SwisServer.Value -CertNames $names
+                        if (-not $res.Matches -and $res.Suggested) {
+                            Write-SWLog ("Hostname mismatch. Valid names: " + ($res.Names -join ', ')) -Level WARNING
+                            $useSuggested = Read-Host "Use '$($res.Suggested)' instead? (Y/n)"
+                            if ([string]::IsNullOrWhiteSpace($useSuggested) -or $useSuggested -match '^[Yy]$') {
+                                $SwisServer.Value = $res.Suggested
+                            }
+                        }
+                    }
+                }
+                Read-Host "Press Enter to continue"
+            }
+            '6' {
+                if (-not $SwisServer.Value) {
+                    Write-SWLog "Set a hostname first." -Level WARNING
+                    Start-Sleep -Seconds 1
+                } else {
+                    Invoke-SWCertTroubleshoot -Server $SwisServer.Value -Port $SwisCertPort
+                    Read-Host "Press Enter to continue"
+                }
+            }
+            '0' {
+                return @{ Action = 'Return' }
+            }
+            default {
+                Write-SWLog "Invalid selection" -Level WARNING
+                Start-Sleep -Seconds 1
+            }
+        }
+    } while ($true)
 }
 
 function Invoke-SWCertTroubleshoot {
@@ -855,7 +1015,11 @@ function Show-MainMenu {
     Write-SWLog "  0. Exit" -Level INFO
     Write-Host ""
 
-    Write-SWLog "QUICK SHORTCUTS: [N]ode Search  [T]emplates  [A]lerts  [M]aintenance  [R]efresh [E]xport" -Level PROMPT
+    if ($script:SWSafeMode) {
+        Write-SWLog "SAFE MODE ACTIVE: live queries are paused. Use option 9 to repair connection/auth/certificate settings." -Level WARNING
+    }
+
+    Write-SWLog "QUICK SHORTCUTS: [N]ode Search  [T]emplates  [A]lerts  [M]aintenance  [R]efresh [E]xport [9] Connection" -Level PROMPT
     Write-SWLog ""
 }
 
@@ -1723,7 +1887,23 @@ function Invoke-MaintenanceManagement {
             }   # end case "2"
 
             "3" {
-                break maintenanceMenu
+                $nodes = Get-SWNodes -Swis $Swis -StatusFilter 'Unmanaged'
+                if (-not $nodes -or $nodes.Count -eq 0) {
+                    Write-SWLog "No nodes are currently in maintenance mode" -Level INFO
+                    Read-Host "Press Enter to continue"
+                    continue
+                }
+
+                $selectedNode = Get-SWSelection -Items $nodes -Title "Select Node to Resume" -DisplayProperty "Caption"
+                if (-not $selectedNode) {
+                    continue
+                }
+
+                $result = Remove-SWMaintenance -Swis $Swis -NodeId $selectedNode.NodeID
+                if ($result.Success) {
+                    Write-SWLog "Exited maintenance mode for $($selectedNode.Caption)" -Level SUCCESS
+                }
+                Read-Host "Press Enter to continue"
             }
 
             "0" {
@@ -1846,7 +2026,7 @@ function Invoke-ApplicationManagement {
                     continue
                 }
 
-                $nodes = Get-SWNodes -Swis -MaxResults 50
+                $nodes = Get-SWNodes -Swis $Swis -MaxResults 50
                 $selectedNode = Get-SWSelection -Items $nodes -Title "Select Node" -DisplayProperty "Caption"
 
                 if (-not $selectedNode) {
@@ -2032,7 +2212,7 @@ function Invoke-ExportMenu {
             }
 
             "3" {
-                $nodes = Get-SWNodes -Swis -Swis -MaxResults 100
+                $nodes = Get-SWNodes -Swis $Swis -MaxResults 100
                 if ($nodes.Count -eq 0) {
                     Write-SWLog "No nodes available" -Level WARNING
                     Read-Host "Press Enter to continue"
@@ -2135,7 +2315,7 @@ function Invoke-QuickActions {
                 Write-SWLog "Enter node hostname/IP:" -Level PROMPT -NoNewline
                 $hostname = Read-Host
 
-                $node = Get-SWNodes -Swis -SearchTerm $hostname | Select-Object -First 1
+                $node = Get-SWNodes -Swis $Swis -SearchTerm $hostname | Select-Object -First 1
 
                 if (-not $node) {
                     Write-SWLog "Node not found" -Level WARNING
@@ -2155,7 +2335,7 @@ function Invoke-QuickActions {
                 Write-SWLog "Enter node hostname/IP:" -Level PROMPT -NoNewline
                 $hostname = Read-Host
 
-                $node = Get-SWNodes -Swis -SearchTerm $hostname | Select-Object -First 1
+                $node = Get-SWNodes -Swis $Swis -SearchTerm $hostname | Select-Object -First 1
 
                 if (-not $node) {
                     Write-SWLog "Node not found" -Level WARNING
@@ -2292,6 +2472,9 @@ $script:SWConnection = $null
 $script:SWServer = $null
 $script:SWLastRefresh = $null
 $script:SWSafeMode = $false
+$script:SWStoredUserName = $UserName
+$script:SWStoredPassword = $Password
+$script:SWUseTrustedAuth = $false
 
 try {
     $origCertCallback = $null
@@ -2357,13 +2540,19 @@ try {
             $SwisServer = Read-Host
         }
 
-        if (-not $UserName) {
+        $UserName = $script:SWStoredUserName
+        $Password = $script:SWStoredPassword
+
+        if (-not $script:SWUseTrustedAuth -and -not $UserName) {
+            Write-SWLog "Authentication mode: Credential" -Level INFO
             $credential = Get-Credential -Message "SolarWinds Credentials"
             $UserName = $credential.UserName
             $Password = $credential.Password
+            $script:SWStoredUserName = $UserName
+            $script:SWStoredPassword = $Password
         }
 
-        $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
+        $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password -UseTrusted:$script:SWUseTrustedAuth
 
         if (-not $connection.Connected) {
             Write-SWLog "Failed to connect to SolarWinds" -Level ERROR
@@ -2375,12 +2564,12 @@ try {
 
         $script:SWConnection = $connection.Connection
 
-        $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+        $queryTest = Update-SWConnectionHealth -Swis $script:SWConnection
         if (-not $queryTest.Success) {
-            $errText = $queryTest.Error.Exception.Message
-            $innerText = if ($queryTest.Error.Exception.InnerException) { $queryTest.Error.Exception.InnerException.Message } else { "" }
+            $errText = if ($queryTest.Error) { $queryTest.Error.Exception.Message } else { "Unknown query failure" }
+            $innerText = if ($queryTest.Error -and $queryTest.Error.Exception.InnerException) { $queryTest.Error.Exception.InnerException.Message } else { "" }
 
-            if ($errText -like "*verifying security for the message*" -or $innerText -like "*verifying security for the message*") {
+            if ($queryTest.MessageSecurity) {
                 Write-SWLog "SWIS query failed due to message security validation." -Level ERROR
                 Write-SWLog "This is usually a certificate/hostname or trust chain issue." -Level WARNING
 
@@ -2405,10 +2594,10 @@ try {
 
                             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12                                
                             
-                            $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
+                            $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password -UseTrusted:$script:SWUseTrustedAuth
                             if ($connection.Connected) {
                                 $script:SWConnection = $connection.Connection
-                                $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                                $queryTest = Update-SWConnectionHealth -Swis $script:SWConnection
                                 if ($queryTest.Success) {
                                     Write-SWLog "Query succeeded with insecure bypass." -Level SUCCESS
                                     $script:SWSafeMode = $false
@@ -2436,10 +2625,10 @@ try {
                                         }
 
                                         # Reconnect with proper hostname
-                                        $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
+                                        $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password -UseTrusted:$script:SWUseTrustedAuth
                                         if ($connection.Connected) {
                                             $script:SWConnection = $connection.Connection
-                                            $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                                            $queryTest = Update-SWConnectionHealth -Swis $script:SWConnection
                                             if ($queryTest.Success) {
                                                 Write-SWLog "Query succeeded after certificate install!" -Level SUCCESS
                                                 $script:SWSafeMode = $false
@@ -2479,21 +2668,21 @@ try {
                                     if ([string]::IsNullOrWhiteSpace($ans) -or $ans -match '^[Yy]$') { $SwisServer = $res.Suggested }
                                 }
                             }
-                            $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
+                            $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password -UseTrusted:$script:SWUseTrustedAuth
                             if ($connection.Connected) {
                                 $script:SWConnection = $connection.Connection
                             }
 
-                            $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                            $queryTest = Update-SWConnectionHealth -Swis $script:SWConnection
                             if (-not $queryTest.Success) {
                                 Write-SWLog "Query still failing after cert install." -Level WARNING
                                 $retryHost = Read-Host "Try again with a different hostname/FQDN? (enter host or leave blank to skip)"
                                 if ($retryHost) {
                                     $SwisServer = $retryHost
-                                    $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password
+                                    $connection = Get-SWConnection -Server $SwisServer -User $UserName -SecurePassword $Password -UseTrusted:$script:SWUseTrustedAuth
                                     if ($connection.Connected) {
                                         $script:SWConnection = $connection.Connection
-                                        $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                                        $queryTest = Update-SWConnectionHealth -Swis $script:SWConnection
                                         if ($queryTest.Success) {
                                             Write-SWLog "Query succeeded after FQDN retry." -Level SUCCESS
                                         } else {
@@ -2514,7 +2703,7 @@ try {
                                         }
 
                                         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                                        $queryTest = Test-SWSwisQuery -Swis $script:SWConnection
+                                        $queryTest = Update-SWConnectionHealth -Swis $script:SWConnection
                                         if ($queryTest.Success) {
                                             Write-SWLog "Query succeeded with insecure bypass." -Level SUCCESS
                                             $script:SWSafeMode = $false
@@ -2562,7 +2751,14 @@ try {
             $selection = Read-Host
 
             if ($selection -eq "R" -or $selection -eq "r") {
-                $script:SWLastRefresh = Get-Date
+                $queryTest = Update-SWConnectionHealth -Swis $script:SWConnection
+                if ($queryTest.Success) {
+                    Write-SWLog "Connection health check passed." -Level SUCCESS
+                    $script:SWLastRefresh = Get-Date
+                } else {
+                    Write-SWLog "Connection health check failed. Use option 9 to repair settings/cert trust." -Level WARNING
+                }
+                Start-Sleep -Seconds 1
                 continue
             }
 
@@ -2592,27 +2788,27 @@ try {
 
             switch ($selection) {
                 "1" {
-                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; break }
+                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; use option 9 to repair connection/auth/certificate settings." -Level WARNING; Read-Host "Press Enter to return to menu"; continue }
                     Invoke-NodeManagement -Swis $script:SWConnection
                 }
 
                 "2" {
-                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; break }
+                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; use option 9 to repair connection/auth/certificate settings." -Level WARNING; Read-Host "Press Enter to return to menu"; continue }
                     Invoke-TemplateManagement -Swis $script:SWConnection
                 }
 
                 "3" {
-                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; break }
+                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; use option 9 to repair connection/auth/certificate settings." -Level WARNING; Read-Host "Press Enter to return to menu"; continue }
                     Invoke-ApplicationManagement -Swis $script:SWConnection
                 }
 
                 "4" {
-                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; break }
+                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; use option 9 to repair connection/auth/certificate settings." -Level WARNING; Read-Host "Press Enter to return to menu"; continue }
                     Invoke-AlertManagement -Swis $script:SWConnection
                 }
 
                 "5" {
-                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; fix cert/host and retry." -Level WARNING; break }
+                    if ($script:SWSafeMode) { Write-SWLog "SAFE MODE: Connection not healthy; use option 9 to repair connection/auth/certificate settings." -Level WARNING; Read-Host "Press Enter to return to menu"; continue }
                     Invoke-MaintenanceManagement -Swis $script:SWConnection
                 }
 
@@ -2629,17 +2825,23 @@ try {
                 }
 
                 "9" {
-                    Write-SWLog "Current connection: $script:SWServer" -Level INFO
-                    $newHost = Read-Host "Enter new hostname (leave blank to keep $script:SWServer)"
-                    if (-not [string]::IsNullOrWhiteSpace($newHost)) {
-                        $SwisServer = $newHost
-                    }
-                    if ($script:SWConnection) {
-                        if (Get-Command Disconnect-Swis -ErrorAction SilentlyContinue) {
-                            Disconnect-Swis -SwisConnection $script:SWConnection -ErrorAction SilentlyContinue
+                    $menuResult = Invoke-SWConnectionMenu -SwisServer ([ref]$SwisServer) -UserName ([ref]$UserName) -Password ([ref]$Password)
+                    if ($menuResult.Action -eq 'Reconnect') {
+                        if ($menuResult.PromptForCredentials) {
+                            $UserName = $null
+                            $Password = $null
+                            $script:SWStoredUserName = $null
+                            $script:SWStoredPassword = $null
+                        } else {
+                            $script:SWStoredUserName = $UserName
+                            $script:SWStoredPassword = $Password
                         }
+                        if ($script:SWConnection -and (Get-Command Disconnect-Swis -ErrorAction SilentlyContinue)) {
+                            Disconnect-Swis -SwisConnection $script:SWConnection -ErrorAction SilentlyContinue
+                            $script:SWConnection = $null
+                        }
+                        continue :scriptLoop
                     }
-                    continue :scriptLoop
                 }
 
                 "0" {

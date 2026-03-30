@@ -619,15 +619,24 @@ function Invoke-SmbChecks {
     $smbAuditEvents = Get-LogEvents -Filter @{ LogName = 'Microsoft-Windows-SMBServer/Audit'; Id = 3000; StartTime = $script:WindowStart }
     $historicalSmb1Count = $smbAuditEvents.Count
     if ($smbAuditEvents.Count -gt 0) {
-        $clients = New-Object 'System.Collections.Generic.List[string]'
+        # Events are returned newest-first by Get-WinEvent; preserve that order so the
+        # first 10 reported addresses are the most recently seen clients.
+        $seenAddrs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $recentClients = New-Object 'System.Collections.Generic.List[string]'
         foreach ($event in $smbAuditEvents) {
-            $message = [string]$event.Message
-            if ($message -match 'Client Address:\s*(\S+)') {
-                $clients.Add($Matches[1])
+            $data = Get-EventDataMap -Event $event
+            $addr = if ($data['ClientAddress']) { [string]$data['ClientAddress'] }
+                    elseif ($data['ClientName'])  { [string]$data['ClientName'] }
+                    else {
+                        $msg = [string]$event.Message
+                        if ($msg -match 'Client Address:\s*(\S+)') { $Matches[1] } else { $null }
+                    }
+            if ($addr -and $seenAddrs.Add($addr)) {
+                $recentClients.Add($addr)
             }
         }
-        $clientList = ($clients | Sort-Object -Unique | Select-Object -First 10) -join ', '
-        Add-Check 'SMB' 'Historical SMBv1 client attempts' 'FAIL' ("{0} SMBv1 audit event(s) detected." -f $smbAuditEvents.Count) $clientList 'Identify and update the legacy clients before upgrading.'
+        $clientList = ($recentClients | Select-Object -First 10) -join ', '
+        Add-Check 'SMB' 'Historical SMBv1 client attempts' 'FAIL' ("{0} SMBv1 audit event(s) from {1} unique client(s) detected." -f $smbAuditEvents.Count, $seenAddrs.Count) $clientList 'Identify and update the legacy clients before upgrading.'
     } else {
         Add-Check 'SMB' 'Historical SMBv1 client attempts' 'INFO' 'No SMBv1 audit events were found in the selected window.' 'Microsoft-Windows-SMBServer/Audit Event ID 3000' 'If SMBv1 auditing is off, this is an evidence gap rather than proof that no client uses SMBv1.'
     }
@@ -909,9 +918,34 @@ function Invoke-LegacyToolingChecks {
         }
     }
 
+    # Check the classic Windows PowerShell event log for actual PS 2.0 engine starts.
+    # Event ID 400 is written each time the PowerShell engine initialises; the free-text
+    # body contains "EngineVersion=2.0" when invoked with -Version 2.
+    $ps2LogHits = New-Object 'System.Collections.Generic.List[string]'
+    $ps2LogEvents = Get-LogEvents -Filter @{ LogName = 'Windows PowerShell'; Id = 400; StartTime = $script:WindowStart }
+    foreach ($ps2Evt in $ps2LogEvents) {
+        $msg = [string]$ps2Evt.Message
+        if ($msg -match 'EngineVersion=2\.') {
+            $hostApp = if ($msg -match 'HostApplication=([^\r\n]+)') { $Matches[1].Trim() } else { 'unknown' }
+            if ($hostApp.Length -gt 120) { $hostApp = $hostApp.Substring(0, 120) + '...' }
+            $ps2LogHits.Add(("Event at {0}: {1}" -f $ps2Evt.TimeCreated.ToString('yyyy-MM-dd HH:mm'), $hostApp))
+        }
+    }
+
     $installedFeatures = Get-InstalledFeatureTable
     $ps2Installed = $installedFeatures.ContainsKey('PowerShell-V2')
-    $ps2EvidenceCount = $ps2TaskHits.Count + $ps2ProcHits.Count
+
+    if ($ps2Installed) {
+        if ($ps2LogHits.Count -gt 0) {
+            Add-Check 'Legacy Tooling' 'PowerShell 2.0 event log evidence' 'FAIL' ("{0} PowerShell 2.0 engine start event(s) detected in this window." -f $ps2LogHits.Count) (($ps2LogHits | Select-Object -First 5) -join '; ') 'PowerShell 2.0 was actively invoked. Identify and remediate those callers before upgrading.'
+        } elseif ($ps2LogEvents.Count -gt 0) {
+            Add-Check 'Legacy Tooling' 'PowerShell 2.0 event log evidence' 'PASS' 'Windows PowerShell log has entries but no PowerShell 2.0 engine starts were detected.' 'Windows PowerShell Event ID 400' ''
+        } else {
+            Add-Check 'Legacy Tooling' 'PowerShell 2.0 event log evidence' 'INFO' 'No Windows PowerShell Event ID 400 entries were found in the selected window.' 'Windows PowerShell log Event ID 400' 'The log may have rolled over or PowerShell was not invoked in this window. Treat as an evidence gap.'
+        }
+    }
+
+    $ps2EvidenceCount = $ps2TaskHits.Count + $ps2ProcHits.Count + $ps2LogHits.Count
     if ($ps2Installed -and $ps2EvidenceCount -gt 0) {
         $evidence = (($ps2TaskHits + $ps2ProcHits) | Select-Object -First 10) -join '; '
         Add-Check 'Legacy Tooling' 'PowerShell 2.0 upgrade impact' 'FAIL' 'PowerShell 2.0 is installed and active usage evidence was found.' $evidence 'These scripts or processes are likely to break on Windows Server 2025 and must be remediated first.'
@@ -1342,7 +1376,11 @@ function Invoke-SoftwareChecks {
 
     $patterns = @(
         @{ Name = 'Exchange 2010'; Regex = 'Exchange Server 2010'; Status = 'FAIL'; Action = 'Exchange 2010 is a major upgrade blocker and must be retired or migrated.' },
-        @{ Name = 'SQL Server 2008 family'; Regex = 'SQL Server 2008|SQL Server 2005'; Status = 'WARN'; Action = 'Validate application support and TLS posture for these old SQL components.' },
+        @{ Name = 'SQL Server 2005 or older'; Regex = 'SQL Server 2005|SQL Server 2000'; Status = 'FAIL'; Action = 'SQL Server 2005 and older are not supported on Windows Server 2025 and must be retired or migrated.' },
+        @{ Name = 'SQL Server 2008 / 2008 R2'; Regex = 'SQL Server 2008'; Status = 'FAIL'; Action = 'SQL Server 2008/R2 (EOL July 2019) is not supported on Windows Server 2025. Upgrade or migrate this instance.' },
+        @{ Name = 'SQL Server 2012'; Regex = 'SQL Server 2012'; Status = 'FAIL'; Action = 'SQL Server 2012 (EOL July 2022) is not supported on Windows Server 2025. Upgrade or migrate this instance.' },
+        @{ Name = 'SQL Server 2014'; Regex = 'SQL Server 2014'; Status = 'WARN'; Action = 'SQL Server 2014 (EOL July 2024) has limited WS2025 compatibility. Plan an upgrade before proceeding.' },
+        @{ Name = 'SQL Server 2016'; Regex = 'SQL Server 2016'; Status = 'WARN'; Action = 'SQL Server 2016 requires SP3 + CU17 or later for Windows Server 2025 support. Verify the current patch level.' },
         @{ Name = 'Java 6/7'; Regex = '^Java\s+(6|7)\b|J2SE Runtime Environment'; Status = 'WARN'; Action = 'Older Java runtimes often have TLS and cipher issues. Validate every dependent application.' },
         @{ Name = 'Legacy Citrix'; Regex = 'XenApp 6|XenApp 5'; Status = 'WARN'; Action = 'Validate compatibility and published app dependencies.' }
     )
@@ -1353,6 +1391,105 @@ function Invoke-SoftwareChecks {
             Add-Check 'Software' ("Legacy software: {0}" -f $pattern.Name) $pattern.Status ("{0} matching package(s) detected." -f $hits.Count) (($hits | Select-Object -ExpandProperty DisplayName -Unique | Select-Object -First 10) -join '; ') $pattern.Action
         } else {
             Add-Check 'Software' ("Legacy software: {0}" -f $pattern.Name) 'PASS' 'No matching packages were detected.' 'Installed software inventory' ''
+        }
+    }
+
+    # SQL Server database engine instance deep validation.
+    # The display-name patterns above catch SQL components broadly (clients, tools, SSMS).
+    # This block reads actual Database Engine instances from the SQL Server registry key,
+    # resolves the precise build version, and then checks whether each concerning instance
+    # is currently running or has recent Application event log activity — confirming active
+    # use before reporting it as a blocker vs. a dormant installation.
+    $sqlInstanceRoot = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL'
+    if (Test-Path -LiteralPath $sqlInstanceRoot) {
+        $sqlInstanceProp = $null
+        try {
+            $sqlInstanceProp = Get-ItemProperty -LiteralPath $sqlInstanceRoot -ErrorAction Stop
+        } catch { }
+
+        if ($sqlInstanceProp) {
+            foreach ($prop in $sqlInstanceProp.PSObject.Properties) {
+                if ($prop.Name -like 'PS*') { continue }
+                $instanceName = $prop.Name          # e.g. MSSQLSERVER or MYINSTANCE
+                $regKey       = [string]$prop.Value # e.g. MSSQL15.MSSQLSERVER
+
+                # Resolve the precise version string from the instance's registry subtree.
+                $versionString = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$regKey\MSSQLServer\CurrentVersion" -Name 'CurrentVersion'
+                if (-not $versionString) {
+                    $versionString = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$regKey\Setup" -Name 'Version'
+                }
+
+                $majorVersion = 0
+                if ($versionString -match '^(\d+)\.') { $majorVersion = [int]$Matches[1] }
+
+                # Map major version to WS2025 compatibility concern.
+                $sqlCheckStatus = $null
+                $displayVersion = ''
+                $sqlCheckAction = ''
+                if ($majorVersion -ge 1 -and $majorVersion -le 9) {
+                    $sqlCheckStatus = 'FAIL'
+                    $displayVersion = 'SQL Server 2005 or older'
+                    $sqlCheckAction = 'SQL Server 2005 and older are not supported on Windows Server 2025. Retire or migrate before upgrading.'
+                } elseif ($majorVersion -eq 10) {
+                    $sqlCheckStatus = 'FAIL'
+                    $displayVersion = 'SQL Server 2008 / 2008 R2'
+                    $sqlCheckAction = 'SQL Server 2008/R2 (EOL July 2019) is not supported on Windows Server 2025. Upgrade or migrate this instance.'
+                } elseif ($majorVersion -eq 11) {
+                    $sqlCheckStatus = 'FAIL'
+                    $displayVersion = 'SQL Server 2012'
+                    $sqlCheckAction = 'SQL Server 2012 (EOL July 2022) is not supported on Windows Server 2025. Upgrade or migrate this instance.'
+                } elseif ($majorVersion -eq 12) {
+                    $sqlCheckStatus = 'WARN'
+                    $displayVersion = 'SQL Server 2014'
+                    $sqlCheckAction = 'SQL Server 2014 (EOL July 2024) has limited WS2025 compatibility. Plan an upgrade before proceeding.'
+                } elseif ($majorVersion -eq 13) {
+                    $sqlCheckStatus = 'WARN'
+                    $displayVersion = 'SQL Server 2016'
+                    $sqlCheckAction = 'SQL Server 2016 requires SP3 + CU17 or later for Windows Server 2025 support. Verify the current patch level.'
+                }
+
+                # SQL Server 2017 (14), 2019 (15), 2022 (16) are supported on WS2025 — skip.
+                if (-not $sqlCheckStatus) { continue }
+
+                # Check whether the SQL Server service is currently running.
+                $svcName = if ($instanceName -eq 'MSSQLSERVER') { 'MSSQLSERVER' } else { "MSSQL`$$instanceName" }
+                $svcRunning = $false
+                $svcStatusText = 'not found'
+                try {
+                    $svc = Get-Service -Name $svcName -ErrorAction Stop
+                    $svcStatusText = [string]$svc.Status
+                    $svcRunning    = ($svc.Status -eq 'Running')
+                } catch { }
+
+                # Check the Application event log for SQL Server events in the observation window.
+                $sqlAppEvents = Get-LogEvents -Filter @{
+                    LogName      = 'Application'
+                    ProviderName = $svcName
+                    StartTime    = $script:WindowStart
+                }
+                $recentLogActivity = $sqlAppEvents.Count -gt 0
+
+                # Escalate to FAIL when active use is confirmed.
+                $finalSqlStatus = $sqlCheckStatus
+                if ($svcRunning -or $recentLogActivity) { $finalSqlStatus = 'FAIL' }
+
+                $evidenceParts = New-Object 'System.Collections.Generic.List[string]'
+                if ($versionString) { $evidenceParts.Add("Version $versionString") }
+                $evidenceParts.Add("Service ${svcName}: $svcStatusText")
+                if ($recentLogActivity) {
+                    $evidenceParts.Add(("{0} Application log event(s) from this instance in the observation window" -f $sqlAppEvents.Count))
+                }
+
+                $inUseNote = if ($svcRunning) {
+                    ' Service is currently running — active use confirmed.'
+                } elseif ($recentLogActivity) {
+                    ' Recent Application log activity confirms this instance was active in the observation window.'
+                } else {
+                    ' Service is not running and no recent Application log activity was found; instance may be dormant.'
+                }
+
+                Add-Check 'Software' ("SQL Server engine instance: $instanceName ($displayVersion)") $finalSqlStatus ("$displayVersion detected on instance $instanceName.$inUseNote") ($evidenceParts -join '; ') $sqlCheckAction
+            }
         }
     }
 }
