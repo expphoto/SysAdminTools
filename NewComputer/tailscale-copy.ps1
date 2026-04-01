@@ -36,8 +36,25 @@ function Get-TailscaleKey {
     Write-Host "3. Paste it below." -ForegroundColor White
     Write-Host "------------------------------------------------" -ForegroundColor Yellow
     
-    $key = Read-Host "Paste Auth Key"
+    $key = Read-Host "Paste Auth Key (leave blank for interactive login)"
     return $key.Trim()
+}
+
+function Get-TailscaleStatus {
+    param([string]$TailscalePath)
+
+    try {
+        $rawStatus = & $TailscalePath status --json 2>$null
+        if ([string]::IsNullOrWhiteSpace($rawStatus)) {
+            return $null
+        }
+
+        return $rawStatus | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Unable to read Tailscale status yet: $($_.Exception.Message)" -Level "WARN"
+        return $null
+    }
 }
 
 function Invoke-TailscaleSetup {
@@ -59,10 +76,22 @@ function Invoke-TailscaleSetup {
         $tsPath = "$env:ProgramFiles\Tailscale\Tailscale.exe"
     }
 
+    if (-not (Test-Path $tsPath)) {
+        Write-Log "Tailscale executable was not found after installation." -Level "ERROR"
+        return $null
+    }
+
+    $service = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -ne "Running") {
+        Write-Log "Starting Tailscale service..."
+        Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+    }
+
     Write-Log "Connecting Tailscale VPN..."
-    $status = & $tsPath status --json 2>$null | ConvertFrom-Json
+    $status = Get-TailscaleStatus -TailscalePath $tsPath
     
-    if ($status.BackendState -ne "Running") {
+    if (-not $status -or $status.BackendState -ne "Running") {
         if ([string]::IsNullOrWhiteSpace($AuthKey)) {
             Write-Log "No Key provided. Attempting interactive login..." -Level "WARN"
             & $tsPath up
@@ -72,8 +101,18 @@ function Invoke-TailscaleSetup {
         Start-Sleep -Seconds 5
     }
 
-    $status = & $tsPath status --json 2>$null | ConvertFrom-Json
-    $ip = ($status.TailscaleIPs | Where-Object { $_ -match "^100\." })[0]
+    $status = Get-TailscaleStatus -TailscalePath $tsPath
+    if (-not $status) {
+        Write-Log "Tailscale did not return a valid status." -Level "ERROR"
+        return $null
+    }
+
+    $tailscaleIps = @($status.TailscaleIPs)
+    $ip = @($tailscaleIps | Where-Object { $_ -match "^100\." } | Select-Object -First 1)[0]
+
+    if (-not $ip) {
+        $ip = @($tailscaleIps | Select-Object -First 1)[0]
+    }
     
     if (-not $ip) { Write-Log "Failed to get VPN IP." -Level "ERROR"; return $null }
     
@@ -105,6 +144,108 @@ function New-TempUser {
     }
 }
 
+function Read-SelectionIndexes {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Max,
+
+        [string]$Prompt = "Enter selections"
+    )
+
+    while ($true) {
+        $rawSelection = Read-Host "$Prompt (example: 1,3-5 or A for all)"
+        if ([string]::IsNullOrWhiteSpace($rawSelection)) {
+            Write-Log "A selection is required." -Level "WARN"
+            continue
+        }
+
+        if ($rawSelection.Trim().ToUpper() -eq 'A') {
+            return 0..($Max - 1)
+        }
+
+        $indexes = New-Object System.Collections.Generic.List[int]
+        $isValid = $true
+
+        foreach ($token in ($rawSelection -split ',')) {
+            $part = $token.Trim()
+            if (-not $part) {
+                continue
+            }
+
+            if ($part -match '^(\d+)-(\d+)$') {
+                $start = [int]$matches[1]
+                $end = [int]$matches[2]
+
+                if ($start -lt 1 -or $end -lt 1 -or $start -gt $Max -or $end -gt $Max) {
+                    $isValid = $false
+                    break
+                }
+
+                if ($start -le $end) {
+                    foreach ($i in $start..$end) {
+                        if (-not $indexes.Contains($i - 1)) { [void]$indexes.Add($i - 1) }
+                    }
+                }
+                else {
+                    foreach ($i in $end..$start) {
+                        if (-not $indexes.Contains($i - 1)) { [void]$indexes.Add($i - 1) }
+                    }
+                }
+
+                continue
+            }
+
+            if ($part -match '^\d+$') {
+                $value = [int]$part
+                if ($value -lt 1 -or $value -gt $Max) {
+                    $isValid = $false
+                    break
+                }
+
+                if (-not $indexes.Contains($value - 1)) { [void]$indexes.Add($value - 1) }
+                continue
+            }
+
+            $isValid = $false
+            break
+        }
+
+        if ($isValid -and $indexes.Count -gt 0) {
+            return $indexes.ToArray() | Sort-Object
+        }
+
+        Write-Log "Invalid selection. Use numbers, commas, ranges, or A for all." -Level "WARN"
+    }
+}
+
+function Select-ItemsFromConsole {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Items,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Title,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$DisplayScript,
+
+        [string]$Prompt = "Choose items"
+    )
+
+    if (-not $Items -or $Items.Count -eq 0) {
+        return @()
+    }
+
+    Write-Host "`n$Title" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $display = & $DisplayScript $Items[$i]
+        Write-Host ("[{0}] {1}" -f ($i + 1), $display) -ForegroundColor White
+    }
+
+    $selectedIndexes = Read-SelectionIndexes -Max $Items.Count -Prompt $Prompt
+    return @($selectedIndexes | ForEach-Object { $Items[$_] })
+}
+
 function Get-UserSelection {
     Write-Log "Scanning for User Profiles..."
     $userProfiles = Get-ChildItem "C:\Users" -Directory | Where-Object { 
@@ -125,8 +266,10 @@ function Get-UserSelection {
 
     if ($list.Count -eq 0) { Write-Log "No user profiles found!" -Level "ERROR"; exit }
     
-    Write-Host "`nSelect User Profile(s) to Migrate:" -ForegroundColor Cyan
-    return $list | Out-GridView -Title "Select Users" -OutputMode Multiple
+    return Select-ItemsFromConsole -Items $list -Title "Select User Profile(s) to Migrate" -Prompt "Select user numbers" -DisplayScript {
+        param($item)
+        "{0} | {1} | {2} GB" -f $item.User, $item.Path, $item.SizeGB
+    }
 }
 
 function Get-AppDataSelection {
@@ -160,8 +303,207 @@ function Get-AppDataSelection {
         }
     }
 
-    Write-Host "`nSelect AppData Folders to Include:" -ForegroundColor Cyan
-    return $folderList | Out-GridView -Title "Select App Data" -OutputMode Multiple
+    return Select-ItemsFromConsole -Items $folderList -Title "Select AppData Folders to Include" -Prompt "Select folder numbers" -DisplayScript {
+        param($item)
+        "{0} | {1} | {2} MB" -f $item.Name, $item.Path, $item.SizeMB
+    }
+}
+
+function Convert-ToRelativeProfilePath {
+    param([string]$Path)
+
+    $normalizedPath = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($normalizedPath)
+    return $normalizedPath.Substring($root.Length)
+}
+
+function Stage-ProfileFolders {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$SelectedFolders,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationRoot
+    )
+
+    if (-not (Test-Path $DestinationRoot)) {
+        New-Item -Path $DestinationRoot -ItemType Directory -Force | Out-Null
+    }
+
+    $manifestEntries = @()
+
+    foreach ($folder in $SelectedFolders) {
+        $relativePath = Convert-ToRelativeProfilePath -Path $folder.Path
+        $stagedPath = Join-Path $DestinationRoot $relativePath
+        $stagedParent = Split-Path $stagedPath -Parent
+
+        if (-not (Test-Path $stagedParent)) {
+            New-Item -Path $stagedParent -ItemType Directory -Force | Out-Null
+        }
+
+        Write-Log "Staging $($folder.Path) -> $stagedPath"
+        robocopy $folder.Path $stagedPath /E /ZB /COPY:DAT /R:2 /W:3 /MT:8 /NFL /NDL /NJH /NJS /NP | Out-Null
+        $manifestEntries += $relativePath
+    }
+
+    return $manifestEntries
+}
+
+function Convert-RelativeProfilePathToDestination {
+    param(
+        [string]$RelativePath,
+        [string[]]$SourceUsers,
+        [string]$DestinationUser
+    )
+
+    foreach ($sourceUser in $SourceUsers) {
+        $pattern = [regex]::Escape("Users\$sourceUser\")
+        if ($RelativePath -match "^$pattern") {
+            return Join-Path $env:SystemDrive ($RelativePath -replace $pattern, "Users\$DestinationUser\")
+        }
+    }
+
+    return Join-Path $env:SystemDrive $RelativePath
+}
+
+function Save-SessionState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State
+    )
+
+    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $Path -Encoding UTF8
+}
+
+function Load-SessionState {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        return $null
+    }
+
+    try {
+        return Get-Content -Path $Path -Raw | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Unable to load saved session state: $($_.Exception.Message)" -Level "WARN"
+        return $null
+    }
+}
+
+function Remove-SessionState {
+    param([string]$Path)
+
+    if (Test-Path $Path) {
+        Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Initialize-SourceShare {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ShareUser,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SharePass,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SharePath
+    )
+
+    if (-not (New-TempUser -User $ShareUser -Pass $SharePass)) {
+        Write-Log "Unable to create or update the temporary share account." -Level "ERROR"
+        return $false
+    }
+
+    Get-SmbShare -Name "MigShare$" -ErrorAction SilentlyContinue | Remove-SmbShare -Force
+    New-SmbShare -Name "MigShare$" -Path $SharePath -FullAccess $ShareUser | Out-Null
+    return $true
+}
+
+function Show-SourceReadySummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VpnIP,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ShareUser,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SharePass
+    )
+
+    Write-Host "`n========================================" -ForegroundColor Green
+    Write-Host "   SOURCE READY" -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host "VPN IP Address : $VpnIP" -ForegroundColor Cyan
+    Write-Host "Username       : $ShareUser" -ForegroundColor Cyan
+    Write-Host "Password       : $SharePass" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host "Switch to Destination machine now." -ForegroundColor Yellow
+}
+
+function Wait-ForSourceConnection {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StatePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SharePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ShareUser,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SharePass,
+
+        [Parameter(Mandatory = $true)]
+        [string]$VpnIP
+    )
+
+    while ($true) {
+        Write-Host "`nSource actions: [Enter/W] wait  [S] show details  [R] recreate share  [Q] quit and resume later  [X] clear saved state and exit" -ForegroundColor Yellow
+        $action = Read-Host "Choose action"
+
+        $normalizedAction = ''
+        if ($null -ne $action) {
+            $normalizedAction = $action.Trim().ToUpper()
+        }
+
+        switch ($normalizedAction) {
+            '' {
+                Write-Log "Still waiting for the destination machine to connect..."
+            }
+            'W' {
+                Write-Log "Still waiting for the destination machine to connect..."
+            }
+            'S' {
+                Show-SourceReadySummary -VpnIP $VpnIP -ShareUser $ShareUser -SharePass $SharePass
+            }
+            'R' {
+                Write-Log "Recreating SMB share and temporary user..."
+                if (Initialize-SourceShare -ShareUser $ShareUser -SharePass $SharePass -SharePath $SharePath) {
+                    Write-Log "Share recreated successfully." -Level "SUCCESS"
+                    Show-SourceReadySummary -VpnIP $VpnIP -ShareUser $ShareUser -SharePass $SharePass
+                }
+            }
+            'Q' {
+                Write-Log "Source session saved. Re-run the script and choose SOURCE to resume." -Level "WARN"
+                return
+            }
+            'X' {
+                Remove-SessionState -Path $StatePath
+                Write-Log "Saved source session cleared." -Level "WARN"
+                return
+            }
+            default {
+                Write-Log "Unknown action. Use Enter, W, S, R, Q, or X." -Level "WARN"
+            }
+        }
+    }
 }
 
 #endregion
@@ -170,6 +512,7 @@ function Get-AppDataSelection {
 
  $Global:LogPath = "$PSScriptRoot\Migration_$(Get-Date -Format 'yyyyMMdd_HHmm').log"
  $WorkDir = "$env:SystemDrive\MigWork"
+ $StatePath = Join-Path $WorkDir "MigrationSession.json"
 
 if (-not (Test-Path $WorkDir)) { New-Item -Path $WorkDir -ItemType Directory -Force -ErrorAction Stop | Out-Null }
 
@@ -186,7 +529,52 @@ Write-Host "[2] DESTINATION (New PC - Receive Data)"
 
 if ($choice -eq "1") { $Mode = "Source" }
 elseif ($choice -eq "2") { $Mode = "Destination" }
-else { Write-Host "Invalid selection." -Level "ERROR"; exit }
+else { Write-Log "Invalid selection." -Level "ERROR"; exit }
+
+$savedState = $null
+if ($Mode -eq "Source") {
+    $savedState = Load-SessionState -Path $StatePath
+    if ($savedState -and $savedState.Mode -eq "Source" -and $savedState.Status -eq "SourceReady") {
+        Write-Host "`nA saved source session was found for this machine." -ForegroundColor Yellow
+        Write-Host "[1] Resume saved source session"
+        Write-Host "[2] Start a new source session"
+        $resumeChoice = Read-Host "Enter selection (1 or 2)"
+
+        if ($resumeChoice -eq '1') {
+            $myIP = Invoke-TailscaleSetup -AuthKey ""
+            if (-not $myIP) {
+                Read-Host "Press Enter to exit"
+                exit
+            }
+
+            if (-not (Initialize-SourceShare -ShareUser $savedState.ShareUser -SharePass $savedState.SharePass -SharePath $savedState.SharePath)) {
+                Read-Host "Press Enter to exit"
+                exit
+            }
+
+            $savedState.VpnIP = $myIP
+            Save-SessionState -Path $StatePath -State @{
+                Mode = 'Source'
+                Status = 'SourceReady'
+                ShareUser = [string]$savedState.ShareUser
+                SharePass = [string]$savedState.SharePass
+                SharePath = [string]$savedState.SharePath
+                VpnIP = [string]$myIP
+            }
+
+            Show-SourceReadySummary -VpnIP $myIP -ShareUser $savedState.ShareUser -SharePass $savedState.SharePass
+            Wait-ForSourceConnection -StatePath $StatePath -SharePath $savedState.SharePath -ShareUser $savedState.ShareUser -SharePass $savedState.SharePass -VpnIP $myIP
+            exit
+        }
+
+        if ($resumeChoice -ne '2') {
+            Write-Log "Invalid selection." -Level "ERROR"
+            exit
+        }
+
+        Remove-SessionState -Path $StatePath
+    }
+}
 
 # 2. Interactive Key Input
  $tsKey = Get-TailscaleKey
@@ -221,9 +609,13 @@ if ($Mode -eq "Source") {
     $selectedFolders = Get-AppDataSelection -UserPaths $userPaths
     if ($selectedFolders.Count -eq 0) { Write-Log "No folders selected. Exiting." -Level "WARN"; exit }
 
+    # Stage selected data into the shared work directory so the destination can access it.
+    $stagedDataRoot = Join-Path $WorkDir "ProfileData"
+    $manifestEntries = Stage-ProfileFolders -SelectedFolders $selectedFolders -DestinationRoot $stagedDataRoot
+
     # Save Folder Manifest
     $manifestFile = "$WorkDir\Manifest.txt"
-    $selectedFolders.Path | Out-File $manifestFile -Encoding UTF8
+    $manifestEntries | Out-File $manifestFile -Encoding UTF8
 
     # Winget Export
     Write-Log "Exporting application list..."
@@ -248,21 +640,24 @@ if ($Mode -eq "Source") {
     $SharePass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
     $ShareUser = "MigUser"
     
-    New-TempUser -User $ShareUser -Pass $SharePass
-    Get-SmbShare -Name "MigShare$" -ErrorAction SilentlyContinue | Remove-SmbShare -Force
-    New-SmbShare -Name "MigShare$" -Path $WorkDir -FullAccess $ShareUser
+    if (-not (Initialize-SourceShare -ShareUser $ShareUser -SharePass $SharePass -SharePath $WorkDir)) {
+        Read-Host "Press Enter to exit"
+        exit
+    }
+
+    Save-SessionState -Path $StatePath -State @{
+        Mode = 'Source'
+        Status = 'SourceReady'
+        ShareUser = $ShareUser
+        SharePass = $SharePass
+        SharePath = $WorkDir
+        VpnIP = $myIP
+    }
 
     # Output Summary
-    Write-Host "`n========================================" -ForegroundColor Green
-    Write-Host "   SOURCE READY" -ForegroundColor Green
-    Write-Host "========================================" -ForegroundColor Green
-    Write-Host "VPN IP Address : $myIP" -ForegroundColor Cyan
-    Write-Host "Username       : $ShareUser" -ForegroundColor Cyan
-    Write-Host "Password       : $SharePass" -ForegroundColor Cyan
-    Write-Host "========================================" -ForegroundColor Green
-    Write-Host "Switch to Destination machine now." -ForegroundColor Yellow
+    Show-SourceReadySummary -VpnIP $myIP -ShareUser $ShareUser -SharePass $SharePass
     Write-Log "Source setup complete. Waiting for connection..."
-    Pause
+    Wait-ForSourceConnection -StatePath $StatePath -SharePath $WorkDir -ShareUser $ShareUser -SharePass $SharePass -VpnIP $myIP
 }
 
 #endregion
@@ -310,26 +705,22 @@ if ($Mode -eq "Destination") {
     if (Test-Path $folderManifest) {
         $paths = Get-Content $folderManifest
         
-        foreach ($remPath in $paths) {
+        foreach ($relativePath in $paths) {
             # Map source user path to destination user path
-            $destTarget = $null
-            
-            foreach ($sUser in $sourceUsers) {
-                if ($remPath -match "\\Users\\$sUser\\") {
-                    $destTarget = $remPath -replace "\\Users\\$sUser\\", "\Users\$env:USERNAME\"
-                    break
-                }
-            }
-            
-            if (-not $destTarget) { $destTarget = $remPath }
+            $sourcePath = Join-Path "$localMount\ProfileData" $relativePath
+            $destTarget = Convert-RelativeProfilePathToDestination -RelativePath $relativePath -SourceUsers $sourceUsers -DestinationUser $env:USERNAME
 
-            Write-Log "Copying $remPath -> $destTarget"
+            Write-Log "Copying $sourcePath -> $destTarget"
             
-            $logFile = "$WorkDir\Robocopy_$(Split-Path $remPath -Leaf).log"
+            $logFile = "$WorkDir\Robocopy_$(Split-Path $relativePath -Leaf).log"
             
             if (-not (Test-Path $destTarget)) { New-Item -Path $destTarget -ItemType Directory -Force | Out-Null }
+            if (-not (Test-Path $sourcePath)) {
+                Write-Log "Staged source path not found: $sourcePath" -Level "WARN"
+                continue
+            }
             
-            robocopy $remPath $destTarget /E /ZB /COPY:DAT /R:3 /W:5 /MT:8 /NP /LOG:$logFile
+            robocopy $sourcePath $destTarget /E /ZB /COPY:DAT /R:3 /W:5 /MT:8 /NP /LOG:$logFile
         }
     }
 
@@ -342,7 +733,7 @@ if ($Mode -eq "Destination") {
         $muArgs = ""
         foreach ($sUser in $sourceUsers) {
             if ($sUser -ne $env:USERNAME) {
-                 $muArgs += " /mu:$sUser:$env:USERNAME"
+                 $muArgs += " /mu:${sUser}:$env:USERNAME"
             }
         }
         
